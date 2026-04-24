@@ -61,10 +61,10 @@ Measurements collected:
 - observation wrapper conversion time;
 - model prediction time;
 - short end-to-end `learn()` wall time.
+- PPO rollout collection time and PPO gradient-update time.
 
 Measurements still to add later:
 
-- PPO update wall time split from rollout collection;
 - DQN replay insertion/sampling time;
 - eval callback wall time;
 - GPU memory, if readable outside the sandbox.
@@ -106,6 +106,8 @@ Key fields:
   or float32 array handling for planes.
 - `predict_per_call_seconds`: policy inference cost for one observation.
 - `train_steps_per_second`: short end-to-end SB3 training throughput.
+- `ppo_rollout_seconds` and `ppo_update_seconds`: PPO collection/update split
+  during the short training phase.
 - `*_profile_phase_seconds`: total wall time for each profiler phase, including
   env construction and model setup where applicable.
 
@@ -259,6 +261,11 @@ Variants:
 - custom batch wrapper avoiding repeated Python object setup;
 - preloaded puzzle/state arrays for resets.
 
+Implemented controls:
+
+- `train-baseline --n-envs N --vec-env dummy|subproc`
+- `profile-pipeline --n-envs N --vec-env dummy|subproc`
+
 Measure:
 
 - steps/sec vs number of envs;
@@ -282,11 +289,69 @@ Benchmark matrix:
 
 Implementation notes:
 
-- make `make_training_env()` return factory functions for vectorized envs;
+- `make_training_env()` now has factory/vectorized wrappers for SB3 envs;
 - scale PPO `n_steps` carefully: total rollout size is `n_envs * n_steps`;
 - keep the total rollout size comparable between runs when measuring learning
   quality, and vary it separately when measuring pure throughput;
 - use separate log/model dirs for every env-count run.
+
+Suggested PPO throughput probes:
+
+```bash
+uv run pushworld-study profile-pipeline ppo \
+  --puzzle-path data/debug/base_train_5 \
+  --observation-mode planes \
+  --steps 8192 \
+  --device cuda \
+  --n-envs 1 \
+  --vec-env dummy \
+  --output reports/profile_ppo_planes_vec.jsonl
+
+uv run pushworld-study profile-pipeline ppo \
+  --puzzle-path data/debug/base_train_5 \
+  --observation-mode planes \
+  --steps 8192 \
+  --device cuda \
+  --n-envs 4 \
+  --vec-env dummy \
+  --output reports/profile_ppo_planes_vec.jsonl
+
+uv run pushworld-study profile-pipeline ppo \
+  --puzzle-path data/debug/base_train_5 \
+  --observation-mode planes \
+  --steps 8192 \
+  --device cuda \
+  --n-envs 4 \
+  --vec-env subproc \
+  --output reports/profile_ppo_planes_vec.jsonl
+```
+
+Initial vectorized PPO results on `data/debug/base_train_5` with plane
+observations:
+
+| Observation | Env count | Vec env | Train FPS | Speedup vs plane 1 env | Speedup vs RGB 1 env | Env time / train time |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| RGB | 1 | `dummy` | 195.1 | 0.33x | 1.00x | 11.15% |
+| planes | 1 | `dummy` | 586.7 | 1.00x | 3.01x | 1.28% |
+| planes | 4 | `dummy` | 1,327.7 | 2.26x | 6.80x | 2.88% |
+| planes | 4 | `subproc` | 1,128.9 | 1.92x | 5.79x | 2.47% |
+| planes | 8 | `dummy` | 1,609.5 | 2.74x | 8.25x | 3.58% |
+| planes | 16 | `dummy` | 1,786.5 | 3.05x | 9.15x | 3.86% |
+
+Interpretation:
+
+- Same-process vectorization is already a large PPO throughput win.
+- `SubprocVecEnv` is slower than `DummyVecEnv` at four envs on Level 0 plane
+  observations, likely because each environment step is too cheap to amortize
+  IPC overhead.
+- `DummyVecEnv` keeps improving through 16 envs, but returns diminish after 4
+  envs. The main jump is from single-env collection to batched collection.
+- Combined plane observations plus `DummyVecEnv` reaches about `6.8x` speedup at
+  4 envs and `9.2x` at 16 envs compared with the vanilla RGB single-env profile.
+- These are throughput probes, not learning-quality runs. Increasing `n_envs`
+  changes PPO's rollout batch shape (`n_envs * n_steps`), so learning
+  comparisons should either keep total rollout size fixed or explicitly treat
+  rollout size as an experimental variable.
 
 Stop condition: if 8-16 CPU envs saturate PPO training and give acceptable fps,
 GPU environment work should wait until Level 1 or larger batched experiments

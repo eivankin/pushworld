@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from pushworld_study.baselines import profile_env_steps, profile_pipeline
+from pushworld_study.baselines import (
+    make_vector_training_env,
+    profile_env_steps,
+    profile_pipeline,
+)
 from pushworld_study.envs import make_pushworld_env
 
 
@@ -61,3 +65,14 @@ def test_profile_pipeline_smoke(tmp_path) -> None:
     assert metrics["predict_iterations"] == 2
     assert metrics["train_steps_per_second"] > 0
     assert output.read_text(encoding="utf-8").strip()
+
+
+def test_dummy_vector_training_env_smoke() -> None:
+    env = make_vector_training_env(
+        observation_mode="planes",
+        n_envs=2,
+        vec_env="dummy",
+    )
+    observation = env.reset()
+    assert observation.shape[0] == 2
+    env.close()

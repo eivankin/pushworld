@@ -170,6 +170,7 @@ def make_model(
     vf_coef: float | None = None,
     net_arch_pi: tuple[int, ...] = (128,),
     net_arch_vf: tuple[int, ...] = (128,),
+    ppo_cls=None,
 ):
     _require_sb3()
 
@@ -178,8 +179,9 @@ def make_model(
     kwargs = policy_kwargs(env.observation_space, features_dim=features_dim)
 
     if algorithm == "ppo":
+        ppo_model_cls = PPO if ppo_cls is None else ppo_cls
         kwargs["net_arch"] = {"pi": list(net_arch_pi), "vf": list(net_arch_vf)}
-        return PPO(
+        return ppo_model_cls(
             "CnnPolicy",
             env,
             learning_rate=2e-4 if learning_rate is None else learning_rate,
@@ -242,14 +244,18 @@ def train_baseline(
     vf_coef: float | None = None,
     net_arch_pi: tuple[int, ...] = (128,),
     net_arch_vf: tuple[int, ...] = (128,),
+    n_envs: int = 1,
+    vec_env: VecEnvType = "dummy",
 ) -> BaselineResult:
     if device == "cpu":
         _configure_cpu_runtime()
 
-    env = make_training_env(
+    env = make_vector_training_env(
         puzzle_path=puzzle_path,
         seed=seed,
         observation_mode=observation_mode,
+        n_envs=n_envs,
+        vec_env=vec_env,
     )
     model = make_model(
         algorithm=algorithm,
@@ -277,11 +283,12 @@ def train_baseline(
             observation_mode=observation_mode,
         )
         best_model_dir = model_dir / f"{algorithm}_best_seed{seed}_{total_timesteps}"
+        effective_eval_freq = max(eval_freq // n_envs, 1)
         callback = EvalCallback(
             eval_env,
             best_model_save_path=str(best_model_dir),
             log_path=str(log_dir / "eval"),
-            eval_freq=eval_freq,
+            eval_freq=effective_eval_freq,
             n_eval_episodes=n_eval_episodes,
             deterministic=eval_deterministic,
             render=False,
@@ -590,15 +597,47 @@ def _profile_short_training(
     observation_mode: ObservationMode,
     device: str,
     train_steps: int,
+    n_envs: int,
+    vec_env: VecEnvType,
 ) -> dict[str, float | int]:
     if device == "cpu":
         _configure_cpu_runtime()
 
-    env = make_training_env(
+    ppo_cls = None
+    if algorithm == "ppo":
+        from stable_baselines3 import PPO
+
+        class TimedPPO(PPO):
+            rollout_seconds = 0.0
+            update_seconds = 0.0
+            rollout_calls = 0
+            update_calls = 0
+
+            def collect_rollouts(self, *args, **kwargs):
+                started_at = time.perf_counter()
+                try:
+                    return super().collect_rollouts(*args, **kwargs)
+                finally:
+                    self.rollout_seconds += time.perf_counter() - started_at
+                    self.rollout_calls += 1
+
+            def train(self) -> None:
+                started_at = time.perf_counter()
+                try:
+                    return super().train()
+                finally:
+                    self.update_seconds += time.perf_counter() - started_at
+                    self.update_calls += 1
+
+        ppo_cls = TimedPPO
+
+    env = make_vector_training_env(
         puzzle_path=puzzle_path,
         max_steps=max_steps,
         seed=seed,
         observation_mode=observation_mode,
+        n_envs=n_envs,
+        vec_env=vec_env,
     )
     model = make_model(
         algorithm=algorithm,
@@ -608,19 +647,37 @@ def _profile_short_training(
         device=device,
         n_steps=min(128, train_steps) if algorithm == "ppo" else 128,
         batch_size=32 if algorithm == "ppo" else None,
+        ppo_cls=ppo_cls,
     )
 
     started_at = time.perf_counter()
     model.learn(total_timesteps=train_steps, progress_bar=False)
     elapsed_seconds = time.perf_counter() - started_at
+    actual_timesteps = int(model.num_timesteps)
     env.close()
 
-    return {
+    metrics = {
         "train_requested_steps": train_steps,
         "train_elapsed_seconds": elapsed_seconds,
-        "train_steps_per_second": train_steps / elapsed_seconds,
-        "train_model_timesteps": int(model.num_timesteps),
+        "train_steps_per_second": actual_timesteps / elapsed_seconds,
+        "train_model_timesteps": actual_timesteps,
+        "train_n_envs": n_envs,
+        "train_vec_env": vec_env,
     }
+    if algorithm == "ppo":
+        rollout_seconds = float(getattr(model, "rollout_seconds", 0.0))
+        update_seconds = float(getattr(model, "update_seconds", 0.0))
+        metrics.update(
+            {
+                "ppo_rollout_seconds": rollout_seconds,
+                "ppo_update_seconds": update_seconds,
+                "ppo_rollout_calls": int(getattr(model, "rollout_calls", 0)),
+                "ppo_update_calls": int(getattr(model, "update_calls", 0)),
+                "ppo_rollout_fraction": rollout_seconds / elapsed_seconds,
+                "ppo_update_fraction": update_seconds / elapsed_seconds,
+            }
+        )
+    return metrics
 
 
 def profile_pipeline(
@@ -633,6 +690,8 @@ def profile_pipeline(
     device: str = "cpu",
     predict_iterations: int = 200,
     conversion_iterations: int = 1_000,
+    n_envs: int = 1,
+    vec_env: VecEnvType = "dummy",
     output: Path | None = None,
 ) -> dict[str, float | int | str | tuple[int, ...]]:
     _require_sb3()
@@ -644,6 +703,8 @@ def profile_pipeline(
         "device": device,
         "seed": seed,
         "max_steps": max_steps,
+        "n_envs": n_envs,
+        "vec_env": vec_env,
     }
     started_at = time.perf_counter()
     phase_started_at = time.perf_counter()
@@ -690,6 +751,8 @@ def profile_pipeline(
             observation_mode=observation_mode,
             device=device,
             train_steps=steps,
+            n_envs=n_envs,
+            vec_env=vec_env,
         )
     )
     metrics["train_profile_phase_seconds"] = time.perf_counter() - phase_started_at

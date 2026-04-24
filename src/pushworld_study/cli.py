@@ -86,6 +86,8 @@ def main() -> None:
     pipeline_parser.add_argument("--device", default="cpu")
     pipeline_parser.add_argument("--predict-iterations", type=int, default=200)
     pipeline_parser.add_argument("--conversion-iterations", type=int, default=1_000)
+    pipeline_parser.add_argument("--n-envs", type=int, default=1)
+    pipeline_parser.add_argument("--vec-env", choices=["dummy", "subproc"], default="dummy")
     pipeline_parser.add_argument("--output", type=Path, default=None)
     pipeline_parser.add_argument(
         "--observation-mode",
@@ -117,6 +119,8 @@ def main() -> None:
     train_parser.add_argument("--vf-coef", type=float, default=None)
     train_parser.add_argument("--net-arch-pi", type=parse_int_list, default=(128,))
     train_parser.add_argument("--net-arch-vf", type=parse_int_list, default=(128,))
+    train_parser.add_argument("--n-envs", type=int, default=1)
+    train_parser.add_argument("--vec-env", choices=["dummy", "subproc"], default="dummy")
     train_parser.add_argument(
         "--observation-mode",
         choices=["rgb", "planes"],
@@ -169,6 +173,8 @@ def main() -> None:
             device=args.device,
             predict_iterations=args.predict_iterations,
             conversion_iterations=args.conversion_iterations,
+            n_envs=args.n_envs,
+            vec_env=args.vec_env,
             output=args.output,
         )
         for key, value in metrics.items():
@@ -199,6 +205,8 @@ def main() -> None:
             vf_coef=args.vf_coef,
             net_arch_pi=args.net_arch_pi,
             net_arch_vf=args.net_arch_vf,
+            n_envs=args.n_envs,
+            vec_env=args.vec_env,
         )
         print(f"algorithm={result.algorithm}")
         print(f"total_timesteps={result.total_timesteps}")
