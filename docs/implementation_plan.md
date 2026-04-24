@@ -28,6 +28,7 @@ uv run pushworld-study profile-env --episodes 10 --max-steps 100
 uv sync --group rl
 uv run pushworld-study train-baseline ppo --total-timesteps 128
 uv run pushworld-study train-baseline dqn --total-timesteps 16
+uv run pushworld-study eval-baseline ppo models/ppo_smoke_seed0_100000.zip --puzzle-path data/level0/base/test --max-episodes 200
 ```
 
 Current baseline limitations:
@@ -39,6 +40,8 @@ Current baseline limitations:
   experiment config still needs a memory budget and possibly compact state
   observations.
 - Level 0 generation/splits are not automated yet.
+- Held-out evaluation now exists, but training still needs better checkpoint
+  naming and a compact inference-only save format.
 
 ## Milestone 2: PPO and DQN Smoke Baselines
 

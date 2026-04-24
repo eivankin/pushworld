@@ -27,7 +27,7 @@ dev = [
 rl = [
     "stable-baselines3>=2.3",
     "tensorboard>=2.16",
-    "torch>=2.2",
+    "torch==2.6.0",
 ]
 gpu = [
     "numba>=0.60",

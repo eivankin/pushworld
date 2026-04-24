@@ -83,6 +83,27 @@ uv run pushworld-study train-baseline dqn --total-timesteps 16
 These commands are integration checks, not meaningful learning experiments.
 They save models under `models/` and TensorBoard logs under `runs/`.
 
+Evaluate a saved model on held-out puzzles:
+
+```bash
+uv run pushworld-study eval-baseline ppo \
+  models/ppo_smoke_seed0_100000.zip \
+  --puzzle-path data/level0/base/test \
+  --max-episodes 200
+```
+
+Run PPO with periodic held-out evaluation and best-checkpoint saving:
+
+```bash
+uv run pushworld-study train-baseline ppo \
+  --puzzle-path data/level0/base/train \
+  --eval-puzzle-path data/level0/base/test \
+  --eval-freq 5000 \
+  --n-eval-episodes 50 \
+  --total-timesteps 100000 \
+  --device cuda
+```
+
 ## Baseline Target
 
 The paper's model-free setup is:
@@ -111,3 +132,6 @@ Current implementation notes:
   replay buffer is too large for PushWorld observations;
 - convolution channel counts are an explicit working assumption (`32, 64, 64`),
   because the paper specifies kernels/strides/FC sizes but not channels.
+- the RL dependency group pins `torch==2.6.0`, which has official CUDA 12.4
+  wheels and avoids accidentally resolving CUDA 13 wheels on systems with a
+  CUDA 12.4 driver.

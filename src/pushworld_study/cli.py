@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pushworld_study.baselines import profile_env_steps, train_baseline
+from pushworld_study.baselines import evaluate_baseline, profile_env_steps, train_baseline
 from pushworld_study.envs import PushWorldGymnasiumEnv
 
 
@@ -68,6 +68,28 @@ def main() -> None:
     train_parser.add_argument("--log-dir", type=Path, default=Path("runs"))
     train_parser.add_argument("--model-dir", type=Path, default=Path("models"))
     train_parser.add_argument("--device", default="cpu")
+    train_parser.add_argument("--eval-puzzle-path", type=Path, default=None)
+    train_parser.add_argument("--eval-freq", type=int, default=0)
+    train_parser.add_argument("--n-eval-episodes", type=int, default=20)
+    train_parser.add_argument("--eval-stochastic", action="store_true")
+    train_parser.add_argument("--learning-rate", type=float, default=None)
+    train_parser.add_argument("--ent-coef", type=float, default=None)
+    train_parser.add_argument("--n-steps", type=int, default=128)
+    train_parser.add_argument("--batch-size", type=int, default=None)
+    train_parser.add_argument("--n-epochs", type=int, default=2)
+
+    eval_parser = subparsers.add_parser(
+        "eval-baseline",
+        help="Evaluate a saved PPO/DQN model on each puzzle in a path.",
+    )
+    eval_parser.add_argument("algorithm", choices=["ppo", "dqn"])
+    eval_parser.add_argument("model_path", type=Path)
+    eval_parser.add_argument("--puzzle-path", type=Path, required=True)
+    eval_parser.add_argument("--max-episodes", type=int, default=None)
+    eval_parser.add_argument("--repeat-episodes", type=int, default=1)
+    eval_parser.add_argument("--max-steps", type=int, default=100)
+    eval_parser.add_argument("--stochastic", action="store_true")
+    eval_parser.add_argument("--device", default="cpu")
 
     args = parser.parse_args()
 
@@ -94,7 +116,33 @@ def main() -> None:
             log_dir=args.log_dir,
             model_dir=args.model_dir,
             device=args.device,
+            eval_puzzle_path=args.eval_puzzle_path,
+            eval_freq=args.eval_freq,
+            n_eval_episodes=args.n_eval_episodes,
+            eval_deterministic=not args.eval_stochastic,
+            learning_rate=args.learning_rate,
+            ent_coef=args.ent_coef,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            n_epochs=args.n_epochs,
         )
         print(f"algorithm={result.algorithm}")
         print(f"total_timesteps={result.total_timesteps}")
         print(f"model_path={result.model_path}")
+    elif args.command == "eval-baseline":
+        result = evaluate_baseline(
+            algorithm=args.algorithm,
+            model_path=args.model_path,
+            puzzle_path=args.puzzle_path,
+            max_episodes=args.max_episodes,
+            repeat_episodes=args.repeat_episodes,
+            max_steps=args.max_steps,
+            deterministic=not args.stochastic,
+            device=args.device,
+        )
+        print(f"algorithm={result.algorithm}")
+        print(f"episodes={result.episodes}")
+        print(f"successes={result.successes}")
+        print(f"success_rate={result.success_rate:.4f}")
+        print(f"mean_reward={result.mean_reward:.4f}")
+        print(f"mean_length={result.mean_length:.4f}")
