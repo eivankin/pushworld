@@ -45,6 +45,12 @@
   Gym environment for Sokoban, with random solvable level generation and Boxoban
   support. Relevance for PushWorld: useful for environment API comparisons and
   observation/reward conventions, but it is also legacy Gym-based.
+- PCGRL Gym interface: https://github.com/amidos2006/gym-pcgrl. This project
+  trains RL agents to generate playable levels, including Sokoban levels, using
+  procedural-content-generation representations such as narrow, wide, and turtle.
+  Relevance for PushWorld: useful design reference if we later want to generate
+  PushWorld Level 0/Level 1-like puzzles instead of only consuming the official
+  generator. Its Sokoban task is level generation, not Sokoban solving.
 - MiniHack Boxoban port:
   https://minihack.readthedocs.io/en/latest/envs/ported/boxoban.html. MiniHack
   exposes Boxoban variants with a modern benchmark framing and shaped rewards.
