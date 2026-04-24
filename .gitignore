@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Project-local uv cache.
+.uv-cache/
+
+# Local IDE/project files.
+.idea/
+.codex
+
+# Experiment outputs.
+runs/
+models/
+.matplotlib/

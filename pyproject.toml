@@ -1,0 +1,51 @@
+[project]
+name = "pushworld-study"
+version = "0.1.0"
+description = "Research workspace for RL and GPU-environment experiments on DeepMind PushWorld."
+readme = "README.md"
+authors = [
+    { name = "Evgenij Ivankin", email = "e.ivankin@innopolis.university" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "absl-py>=1.4",
+    "dm-env>=1.5",
+    "fire>=0.4",
+    "gymnasium>=1.0",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+]
+
+[project.scripts]
+pushworld-study = "pushworld_study.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+rl = [
+    "stable-baselines3>=2.3",
+    "tensorboard>=2.16",
+    "torch>=2.2",
+]
+gpu = [
+    "numba>=0.60",
+    "triton>=3.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+exclude = [
+    ".git",
+    ".idea",
+    ".uv-cache",
+    ".venv",
+    "external",
+]
