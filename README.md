@@ -104,6 +104,26 @@ uv run pushworld-study train-baseline ppo \
   --device cuda
 ```
 
+Use compact structured observations instead of RGB pixels:
+
+```bash
+uv run pushworld-study train-baseline ppo \
+  --puzzle-path data/debug/base_train_5 \
+  --eval-puzzle-path data/debug/base_train_5 \
+  --eval-freq 5000 \
+  --n-eval-episodes 25 \
+  --eval-stochastic \
+  --total-timesteps 100000 \
+  --learning-rate 0.0001 \
+  --ent-coef 0.001 \
+  --n-epochs 4 \
+  --n-steps 256 \
+  --batch-size 64 \
+  --seed 0 \
+  --device cuda \
+  --observation-mode planes
+```
+
 ## Baseline Target
 
 The paper's model-free setup is:

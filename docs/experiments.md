@@ -75,15 +75,22 @@ Interpretation:
 
 On five Level 0 base puzzles:
 
-| Run | Train/eval set | Best checkpoint deterministic | Best checkpoint stochastic |
-| --- | --- | ---: |---------------------------:|
-| `PPO_10` | 5 Level 0 base train puzzles | 0/200 |                     30/200 |
-| follow-up lower-LR run | 5 Level 0 base train puzzles | 0/200 |       9/200 by ~150k steps |
+| Run | Train/eval set | Observation | Best checkpoint deterministic | Best checkpoint stochastic |
+| --- | --- | --- | ---: | ---: |
+| `PPO_10` | 5 Level 0 base train puzzles | RGB | 0/200 | 30/200 |
+| follow-up lower-LR run | 5 Level 0 base train puzzles | RGB | 0/200 | 9/200 by ~150k steps |
+| `ppo_planes_fair/PPO_1` | 5 Level 0 base train puzzles | planes | 0/200 | 42/200 |
+| `PPO_14` | 5 Level 0 base train puzzles | planes, larger PPO head | not run | not run |
 
 Interpretation:
 
 - Lowering learning rate did not solve the instability.
-- Stochastic success on five puzzles is nonzero, but unstable and far from
+- Plane observations improved five-puzzle stochastic success modestly and gave a
+  large wall-clock speedup, but did not fix deterministic policy collapse.
+- The larger-head/high-entropy PPO variant tested in `PPO_14` was worse than
+  the default plane PPO setting: TensorBoard eval reward stayed at `-1` for all
+  20 eval checkpoints through 100k steps.
+- Stochastic success on five puzzles is nonzero, but still unstable and far from
   usable.
 - Deterministic success remains zero.
 
@@ -91,7 +98,9 @@ Interpretation:
 
 Baseline PPO with RGB pixel observations is not scaling well beyond one or a few
 easy Level 0 puzzles. It can overfit a single puzzle, but performance becomes
-unstable on five puzzles and collapses on larger small subsets.
+unstable on five puzzles and collapses on larger small subsets. Plane
+observations make PPO substantially faster and slightly improve stochastic
+success on five puzzles, but deterministic evaluation still fails.
 
 For now, PPO should be treated as a weak reference baseline. Before investing in
 longer PPO runs, the likely improvements are:
@@ -154,9 +163,10 @@ Interpretation:
 
 ### Five-Puzzle Debug Run
 
-| Run | Train/eval set | Timesteps | FPS | Best checkpoint deterministic | Best checkpoint stochastic | Final checkpoint deterministic | Final checkpoint stochastic |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `DQN_4` | 5 Level 0 base train puzzles | 50k | 7-10 | 80/200 | 78/200 | 80/200 | 78/200 |
+| Run | Train/eval set | Observation | Timesteps | FPS | Best checkpoint deterministic | Best checkpoint stochastic | Final checkpoint deterministic | Final checkpoint stochastic |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `DQN_4` | 5 Level 0 base train puzzles | RGB | 50k | 8.0 mean | 80/200 | 78/200 | 80/200 | 78/200 |
+| `dqn_planes_fair/DQN_1` | 5 Level 0 base train puzzles | planes | 50k | 161.7 mean | 80/200 | 77/200 | 80/200 | 77/200 |
 
 TensorBoard summary for `DQN_4`:
 
@@ -168,15 +178,26 @@ TensorBoard summary for `DQN_4`:
   value `53.7` at step 45k;
 - deterministic and stochastic repeated evaluation were similar, unlike PPO.
 
+TensorBoard summary for `dqn_planes_fair/DQN_1`:
+
+- end-to-end training speed increased from `8.0` mean FPS in `DQN_4` to `161.7`
+  mean FPS, about a `20.2x` speedup;
+- rollout reward improved from `1.50` at step 400 to `3.80` at step 49.9k;
+- rollout episode length dropped from `100` to `60.1`;
+- eval mean reward improved from `-1.00` at step 5k to `4.27` at step 50k;
+- eval mean episode length improved from `100` to `53.44`;
+- repeated best-checkpoint eval was similar to RGB DQN: deterministic `80/200`,
+  stochastic `77/200`, mean rewards `3.39` and `3.225`.
+
 Interpretation:
 
 - DQN is a stronger pixel baseline than PPO on the debug ladder.
 - The value-based policy is much more stable under deterministic evaluation.
+- Plane observations remove the major wall-clock bottleneck for the current DQN
+  setup while preserving the five-puzzle solution rate.
 - The five-puzzle result is already enough for the current baseline phase:
-  extending DQN to more timesteps or more puzzles is less important than making
-  the pipeline fast enough to test representation and algorithmic hypotheses.
-- The main bottleneck is wall-clock speed. DQN is running around `8 fps`, far
-  below both raw environment throughput and PPO throughput.
+  extending DQN to more timesteps or more puzzles is less important than using
+  the faster pipeline to test representation and algorithmic hypotheses.
 
 Next DQN runs, if needed later, should use shorter timesteps and earlier/more
 frequent evaluation:
@@ -192,16 +213,51 @@ frequent evaluation:
   sets without additional tricks.
 - DQN with RGB pixels is slower but more sample-efficient and more stable on
   small puzzle sets.
+- DQN with plane observations keeps the same five-puzzle success rate while
+  improving training speed by about `20x`.
 - The paper's qualitative observation that DQN may generalize more stably than
   PPO is consistent with our early debug results, although our setup is not an
   exact Acme/JAX reproduction.
 - The next milestone should focus on training-pipeline speed and observation
   representation, not longer runs of the current pixel baselines.
 
-## External PPO/DQN Config Survey
+## Plane Observation Mode
 
-The quick survey did not uncover a directly reusable PushWorld PPO configuration
-outside the paper.
+A first structured-observation mode has been added after the RGB baseline runs.
+It emits 6 binary planes: walls, agent-only walls, agent, goal-associated movable
+objects, other movable objects, and goal cells.
+
+Smoke timing on `data/debug/base_train_5`:
+
+| Observation mode | Steps/sec |
+| --- | ---: |
+| RGB | 1,668 |
+| Planes | 34,118 |
+
+This removes RGB rendering from the observation path and gives a roughly 20x
+speedup for isolated environment stepping on the five-puzzle debug set. The next
+experiment should rerun the five-puzzle PPO comparison with
+`--observation-mode planes`.
+
+Five-puzzle PPO fair-comparison run:
+
+| Run | Observation | TensorBoard final FPS | Mean FPS | Post-warmup mean FPS | Best eval checkpoint | Deterministic repeated eval | Stochastic repeated eval |
+| --- | --- | ---: | ---: | ---: | --- | ---: | ---: |
+| `PPO_10` | RGB | 131 | 137.9 | 136.1 | not recorded here | 0/200 | 30/200 |
+| `PPO_11` | RGB | 130 | 134.5 | 133.1 | not recorded here | 0/200 | 9/200 by ~150k steps |
+| `ppo_planes_fair/PPO_1` | planes | 454 | 458.1 | 454.0 | step 85k, mean reward 3.293 | 0/200 | 42/200 |
+
+Using TensorBoard `time/fps`, the plane run was about `3.32x` faster than
+`PPO_10` by mean FPS and `3.34x` faster by post-warmup mean FPS. Compared with
+`PPO_11`, it was about `3.41x` faster by both mean and post-warmup mean FPS.
+Final-FPS ratios were about `3.47x` vs `PPO_10` and `3.49x` vs `PPO_11`.
+
+Final TensorBoard eval at 100k was mean reward `2.4388` and mean episode length
+`76.44`; the best checkpoint was earlier, at 85k. Repeated stochastic eval on
+the best checkpoint produced mean reward `1.2348` and mean episode length
+`86.73`.
+
+## External PPO/DQN Config Survey
 
 Findings:
 
@@ -225,13 +281,14 @@ Findings:
   uses cropped small-map observations and custom convolutional policies. This is
   useful for future PushWorld level-generation ideas, but it is not a Sokoban
   solving config.
-- The public PushWorld side projects listed in the literature notes did not
-  expose reliable, directly reusable PPO hyperparameters during this pass. Some
-  repositories were unavailable through shallow/partial fetches or did not have
-  accessible experiment reports.
+- Some other public PushWorld side projects listed in the literature notes were
+  unavailable through shallow/partial fetches or did not have accessible
+  experiment reports.
 
 Practical implication:
 
-- Our current PPO issue is less likely to be fixed by copying one public config.
+- Copying public PPO hyperparameters is not enough for this setup. The tested
+  larger-head/high-entropy PPO variant performed worse than our default plane
+  PPO run.
 - More useful next steps are vectorized collection, structured observations,
   deterministic-vs-stochastic checkpointing, and eventually goal relabeling.

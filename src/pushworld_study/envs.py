@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import gymnasium as gym
 import numpy as np
 
 from pushworld_study.paths import default_smoke_puzzle, ensure_upstream_pushworld_on_path
+
+
+ObservationMode = Literal["rgb", "planes"]
 
 
 class PushWorldGymnasiumEnv(gym.Env):
@@ -27,6 +30,7 @@ class PushWorldGymnasiumEnv(gym.Env):
         max_steps: int | None = 100,
         render_mode: str | None = "rgb_array",
         standard_padding: bool = False,
+        observation_mode: ObservationMode = "rgb",
     ) -> None:
         ensure_upstream_pushworld_on_path()
 
@@ -52,6 +56,7 @@ class PushWorldGymnasiumEnv(gym.Env):
         self._pixels_per_cell = DEFAULT_PIXELS_PER_CELL
         self._border_width = DEFAULT_BORDER_WIDTH
         self._render_observation_padded = render_observation_padded
+        self._observation_mode = observation_mode
         self.render_mode = render_mode
 
         self._puzzles = [
@@ -87,12 +92,14 @@ class PushWorldGymnasiumEnv(gym.Env):
         self._current_achieved_goals = 0
         self._steps = 0
 
-        initial_observation = self._render_observation(self._puzzles[0].initial_state)
+        initial_observation = self._observe(self._puzzles[0].initial_state)
+        if observation_mode not in ("rgb", "planes"):
+            raise ValueError("observation_mode must be 'rgb' or 'planes'.")
         self.observation_space = gym.spaces.Box(
             low=0.0,
             high=1.0,
             shape=initial_observation.shape,
-            dtype=np.float32,
+            dtype=initial_observation.dtype,
         )
         self.action_space = gym.spaces.Discrete(NUM_ACTIONS)
 
@@ -121,7 +128,7 @@ class PushWorldGymnasiumEnv(gym.Env):
         )
         self._steps = 0
 
-        return self._render_observation(self._current_state), {
+        return self._observe(self._current_state), {
             "puzzle_state": self._current_state,
             "puzzle_index": puzzle_idx,
         }
@@ -151,7 +158,7 @@ class PushWorldGymnasiumEnv(gym.Env):
             reward = float(current_achieved_goals - previous_achieved_goals - 0.01)
 
         truncated = self._max_steps is not None and self._steps >= self._max_steps
-        observation = self._render_observation(self._current_state)
+        observation = self._observe(self._current_state)
         info = {"puzzle_state": self._current_state}
 
         return observation, reward, bool(terminated), bool(truncated), info
@@ -181,6 +188,45 @@ class PushWorldGymnasiumEnv(gym.Env):
             self._pixels_per_cell,
             self._border_width,
         )
+
+    def _observe(self, state: Any) -> np.ndarray:
+        if self._observation_mode == "rgb":
+            return self._render_observation(state)
+        return self._plane_observation(state)
+
+    def _plane_observation(self, state: Any) -> np.ndarray:
+        if self._current_puzzle is None:
+            puzzle = self._puzzles[0]
+        else:
+            puzzle = self._current_puzzle
+
+        planes = np.zeros((6, self._max_cell_height, self._max_cell_width), dtype=np.float32)
+
+        def set_cells(channel: int, origin: tuple[int, int], cells: set[tuple[int, int]]) -> None:
+            origin_x, origin_y = origin
+            for cell_x, cell_y in cells:
+                x = origin_x + cell_x
+                y = origin_y + cell_y
+                if 0 <= x < self._max_cell_width and 0 <= y < self._max_cell_height:
+                    planes[channel, y, x] = 1.0
+
+        for x, y in puzzle.wall_positions:
+            if 0 <= x < self._max_cell_width and 0 <= y < self._max_cell_height:
+                planes[0, y, x] = 1.0
+        for x, y in puzzle.agent_wall_positions:
+            if 0 <= x < self._max_cell_width and 0 <= y < self._max_cell_height:
+                planes[1, y, x] = 1.0
+
+        goal_count = len(puzzle.goal_state)
+        for movable_idx, movable in enumerate(puzzle.movable_objects):
+            channel = 2 if movable_idx == 0 else 3 if movable_idx <= goal_count else 4
+            set_cells(channel, state[movable_idx], movable.cells)
+
+        for goal_idx, goal in enumerate(puzzle.goal_state, start=1):
+            if goal_idx < len(puzzle.movable_objects):
+                set_cells(5, goal, puzzle.movable_objects[goal_idx].cells)
+
+        return planes
 
 
 class ChannelFirstObservation(gym.ObservationWrapper):
@@ -224,12 +270,18 @@ def make_pushworld_env(
     channel_first: bool = False,
     uint8_observation: bool = False,
     standard_padding: bool = False,
+    observation_mode: ObservationMode = "rgb",
 ) -> gym.Env:
     env: gym.Env = PushWorldGymnasiumEnv(
         puzzle_path=puzzle_path,
         max_steps=max_steps,
         standard_padding=standard_padding,
+        observation_mode=observation_mode,
     )
+    if observation_mode == "planes":
+        if channel_first or uint8_observation:
+            raise ValueError("Plane observations are already channel-first float32.")
+        return env
     if uint8_observation and not channel_first:
         raise ValueError("uint8_observation=True requires channel_first=True.")
     if uint8_observation:

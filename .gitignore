@@ -20,3 +20,5 @@ wheels/
 runs/
 models/
 .matplotlib/
+data/
+reports/

@@ -40,30 +40,99 @@ Training:
 | --- | --- | --- | ---: |
 | `PPO_5` | PPO | Level 0 base train | ~200 |
 | `PPO_8/PPO_9` | PPO | one puzzle | ~195 |
-| `DQN_3` | DQN | one puzzle | 7-10 |
-| `DQN_4` | DQN | five puzzles | 7-10 |
+| `PPO_10` | PPO | five puzzles, RGB | 131 final / 137.9 mean |
+| `PPO_11` | PPO | five puzzles, RGB | 130 final / 134.5 mean |
+| `ppo_planes_fair/PPO_1` | PPO | five puzzles, planes | 454 |
+| `DQN_3` | DQN | one puzzle, RGB | 7-10 |
+| `DQN_4` | DQN | five puzzles, RGB | 8.0 mean |
+| `dqn_planes_fair/DQN_1` | DQN | five puzzles, planes | 161.7 mean |
 
 ## Stage 1: Instrument Current Pipeline
 
-Add timing around:
+Use the lightweight `profile-pipeline` command before larger rewrites. The first
+version works with the existing SB3 training loop and does not require custom
+algorithms.
 
-- env reset;
-- env transition;
-- observation rendering;
-- observation conversion to channel-first/uint8;
-- replay buffer insertion/sampling for DQN;
-- forward pass;
-- backward/update step;
-- eval callback.
+Measurements collected:
 
-Expected output: a CSV or JSONL file with per-stage timings.
+- environment reset time;
+- environment transition/reward time, excluding observation extraction;
+- observation extraction/rendering time;
+- observation wrapper conversion time;
+- model prediction time;
+- short end-to-end `learn()` wall time.
 
-Commands to add:
+Measurements still to add later:
+
+- PPO update wall time split from rollout collection;
+- DQN replay insertion/sampling time;
+- eval callback wall time;
+- GPU memory, if readable outside the sandbox.
+
+Output format:
+
+- write one JSONL row per measurement window;
+- include `algorithm`, `observation_mode`, `puzzle_path`, `seed`,
+  `env_steps`, `train_model_timesteps`, `train_steps_per_second`, and `device`;
+- keep raw timing columns separate so we can compute derived percentages later.
+
+Commands to run:
 
 ```bash
-uv run pushworld-study profile-pipeline --algorithm dqn --puzzle-path data/debug/base_train_5 --steps 5000
-uv run pushworld-study profile-pipeline --algorithm ppo --puzzle-path data/debug/base_train_5 --steps 5000
+uv run pushworld-study profile-pipeline ppo \
+  --puzzle-path data/debug/base_train_5 \
+  --observation-mode rgb \
+  --steps 5000 \
+  --output reports/profile_ppo_rgb_5.jsonl
+
+uv run pushworld-study profile-pipeline ppo \
+  --puzzle-path data/debug/base_train_5 \
+  --observation-mode planes \
+  --steps 5000 \
+  --output reports/profile_ppo_planes_5.jsonl
+
+uv run pushworld-study profile-pipeline dqn \
+  --puzzle-path data/debug/base_train_5 \
+  --observation-mode planes \
+  --steps 5000 \
+  --output reports/profile_dqn_planes_5.jsonl
 ```
+
+Key fields:
+
+- `env_transition_seconds`: PushWorld state transition and reward logic.
+- `env_observe_seconds`: RGB rendering or plane extraction.
+- `conversion_per_observation_seconds`: channel-first/uint8 conversion for RGB
+  or float32 array handling for planes.
+- `predict_per_call_seconds`: policy inference cost for one observation.
+- `train_steps_per_second`: short end-to-end SB3 training throughput.
+- `*_profile_phase_seconds`: total wall time for each profiler phase, including
+  env construction and model setup where applicable.
+
+Acceptance criterion: the profiler should explain enough of observed wall time
+to identify whether the next bottleneck is environment/observation work, model
+inference, SB3 learner/replay overhead, or evaluation.
+
+Initial Level 1/2 plane profiles:
+
+| Profile | Observation shape | Env steps/sec | Train FPS | Env time / train time | Unaccounted setup in old profiler |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Level 0 debug 5 | `6x7x7` | 45,590 | 586.4 | 1.29% | 0.91s |
+| Level 1 | `6x51x42` | 24,589 | 478.8 | 1.95% | 14.11s |
+| Level 2 | `6x39x32` | 13,776 | 487.7 | 3.54% | 94.25s |
+
+Interpretation:
+
+- Per-step plane environment work grows with puzzle complexity but is still not
+  the dominant short-training cost through Level 2.
+- Observation extraction remains the larger part of measured env time, but env
+  time is still only a few percent of training wall time.
+- The old profiler showed large setup/loading overhead on Level 1/2, especially
+  Level 2. Phase-level timing was added so future profiles can separate setup
+  cost from rollout/training cost.
+- This does not yet justify GPU env kernels. The next optimization target is
+  still learner/collection overhead and vectorized PPO, with setup caching worth
+  revisiting if repeated experiment startup becomes painful.
 
 ## Stage 2: More Efficient Observations
 
@@ -80,13 +149,104 @@ Candidates:
 Measure:
 
 - env steps/sec;
+- PPO fps;
 - DQN fps;
 - replay buffer memory;
 - model size;
-- single-puzzle and five-puzzle success.
+- single-puzzle and five-puzzle success;
+- deterministic and stochastic eval success.
 
 Hypothesis: structured planes should improve DQN wall-clock speed more than raw
 GPU env stepping because DQN currently pays heavily for image replay/training.
+
+Initial implementation:
+
+- `--observation-mode planes` emits 6 channel-first float32 planes:
+  - walls;
+  - agent-only walls;
+  - agent;
+  - goal-associated movable objects;
+  - other movable objects;
+  - goal cells.
+- The transition dynamics still use the official `PushWorldPuzzle` logic.
+- RGB rendering is skipped for observations.
+
+Initial smoke timing on `data/debug/base_train_5`:
+
+| Observation mode | Episodes | Steps | Steps/sec |
+| --- | ---: | ---: | ---: |
+| RGB | 20 | 1,517 | 1,668 |
+| Planes | 20 | 1,517 | 34,118 |
+
+This is about a 20x isolated environment-observation speedup on the five-puzzle
+debug set.
+
+Initial training smoke checks:
+
+- PPO with planes on CPU ran around 500-900 fps over a 1,024-step smoke run.
+- DQN with planes on CPU ran around 96 fps over a 512-step smoke run.
+- A full 100k five-puzzle PPO run with plane observations reached final
+  TensorBoard FPS `454`. Compared with five-puzzle RGB PPO runs, the measured
+  end-to-end TensorBoard `time/fps` speedup was about `3.3-3.5x`, depending on
+  whether mean, post-warmup mean, or final FPS is used.
+- A full 50k five-puzzle DQN run with plane observations reached mean
+  TensorBoard FPS `161.7`, compared with `8.0` mean FPS for the RGB `DQN_4`
+  run. This is about a `20.2x` end-to-end speedup while preserving repeated
+  eval success: `80/200` deterministic and `77/200` stochastic.
+
+These numbers are not final benchmark results, but they are strong enough to
+justify rerunning the five-puzzle PPO/DQN comparisons with plane observations.
+
+Fair PPO comparison command:
+
+```bash
+uv run pushworld-study train-baseline ppo \
+  --puzzle-path data/debug/base_train_5 \
+  --eval-puzzle-path data/debug/base_train_5 \
+  --eval-freq 5000 \
+  --n-eval-episodes 25 \
+  --eval-stochastic \
+  --total-timesteps 100000 \
+  --learning-rate 0.0001 \
+  --ent-coef 0.001 \
+  --n-epochs 4 \
+  --n-steps 256 \
+  --batch-size 64 \
+  --seed 0 \
+  --device cuda \
+  --observation-mode planes \
+  --log-dir runs/ppo_planes_fair \
+  --model-dir models/ppo_planes_fair
+```
+
+Compare against the earlier five-puzzle RGB PPO run on:
+
+- training fps;
+- rollout reward curve;
+- eval mean reward curve;
+- best stochastic success over 200 repeated evaluations;
+- deterministic success on the same best checkpoint.
+
+If planes are faster but not better, keep them anyway: they are still the
+cleaner substrate for relabeling and object/state debugging.
+
+Observed result for `ppo_planes_fair/PPO_1`:
+
+- best eval checkpoint: step 85k, mean reward `3.293`;
+- final eval at 100k: mean reward `2.439`, mean length `76.44`;
+- repeated deterministic eval on best checkpoint: `0/200`;
+- repeated stochastic eval on best checkpoint: `42/200`;
+- conclusion: planes are worth keeping for speed and representation clarity, but
+  PPO still needs algorithmic help before scaling beyond a few puzzles.
+
+Observed result for `dqn_planes_fair/DQN_1`:
+
+- final eval checkpoint: step 50k, mean reward `4.270`, mean length `53.44`;
+- repeated deterministic eval on best/final checkpoint: `80/200`;
+- repeated stochastic eval on best/final checkpoint: `77/200`;
+- mean training FPS: `161.7`, about `20.2x` faster than RGB `DQN_4`;
+- conclusion: plane observations should be the default for future DQN
+  experiments.
 
 ## Stage 3: Vectorized CPU Environment
 
@@ -94,9 +254,10 @@ Before GPU kernels, implement a batched CPU environment API.
 
 Variants:
 
-- simple `SyncVectorEnv` with multiple env instances;
+- `DummyVecEnv`/single-process SB3 vectorization as a correctness baseline;
+- `SubprocVecEnv` for parallel CPU collection;
 - custom batch wrapper avoiding repeated Python object setup;
-- preloaded puzzle/state arrays.
+- preloaded puzzle/state arrays for resets.
 
 Measure:
 
@@ -108,15 +269,43 @@ Measure:
 Hypothesis: for Level 0 base, vectorized CPU stepping may already be enough for
 PPO. For DQN, learner/replay may remain dominant.
 
+Benchmark matrix:
+
+| Env count | Observation | Algorithm | Puzzle set |
+| ---: | --- | --- | --- |
+| 1 | planes | PPO | 5 puzzles |
+| 4 | planes | PPO | 5 puzzles |
+| 8 | planes | PPO | 5 puzzles |
+| 16 | planes | PPO | 5 puzzles |
+| 1 | planes | DQN | 5 puzzles |
+| 4 | planes | DQN | 5 puzzles |
+
+Implementation notes:
+
+- make `make_training_env()` return factory functions for vectorized envs;
+- scale PPO `n_steps` carefully: total rollout size is `n_envs * n_steps`;
+- keep the total rollout size comparable between runs when measuring learning
+  quality, and vary it separately when measuring pure throughput;
+- use separate log/model dirs for every env-count run.
+
+Stop condition: if 8-16 CPU envs saturate PPO training and give acceptable fps,
+GPU environment work should wait until Level 1 or larger batched experiments
+need it.
+
 ## Stage 4: GPU/Compiled Transition Prototype
 
 Only after compact observations and CPU vectorization are measured:
 
+- define a dense tensor state representation:
+  - static planes: walls, agent-only walls, goal cells;
+  - dynamic planes: agent, movable object occupancy, object-goal ids if needed;
+  - per-env metadata: step count, solved flag, active puzzle id;
 - implement batched transition for a restricted Level 0 base representation;
-- start with Numba or Triton kernels for 1x1 object puzzles;
+- start with PyTorch tensor ops on GPU before writing custom kernels;
+- if PyTorch ops are too slow, try Numba CUDA or Triton kernels;
 - validate transition equivalence against official `PushWorldPuzzle` on sampled
   states;
-- then extend to shapes/walls/obstacles.
+- then extend to multi-cell shapes, walls, obstacles, and higher levels.
 
 Measure:
 
@@ -125,9 +314,60 @@ Measure:
 - validation mismatch rate;
 - engineering complexity.
 
+Validation suite:
+
+- generate random legal states from official env resets plus random rollouts;
+- replay the same actions through official env and GPU env;
+- compare reward, terminated/truncated flags, agent position, object positions,
+  and rendered plane observations;
+- run at least 10k random transitions per supported puzzle family before using
+  the GPU env for training.
+
+Prototype ladder:
+
+1. CPU tensor reference implementation using the same dense representation.
+2. GPU PyTorch implementation with batch size 1,024+.
+3. Custom kernel only if PyTorch GPU ops leave transition time dominant.
+4. SB3-compatible vector env wrapper.
+5. Native learner integration if SB3 wrapper overhead becomes dominant.
+
 Hypothesis: GPU env stepping will help most on large batches and complex puzzle
 sets, but may not dominate end-to-end training until observation/replay overhead
 is reduced.
+
+Risks:
+
+- exact PushWorld collision/object-shape semantics may be harder to reproduce
+  than the Level 0 base case suggests;
+- SB3 vector-env APIs may erase much of the GPU transition speedup through CPU
+  synchronization;
+- GPU envs are more valuable for PPO-style large-batch collection than for DQN
+  if replay/model updates remain the bottleneck.
+
+Decision gate: do not replace the official env until equivalence tests pass and
+end-to-end PPO fps improves by at least 2x over vectorized CPU planes.
+
+## Stage 4.5: Learner/Replay Optimizations
+
+The DQN result suggests learner and replay overhead can dominate once RGB is
+removed. These changes should be benchmarked separately from environment
+kernels:
+
+- store plane observations as `uint8`/bool in replay and cast on batch load;
+- reduce replay copies by preallocating contiguous arrays;
+- test smaller CNNs for 6-plane inputs;
+- test MLP over object-table features for Level 0 base;
+- use larger batches only after checking GPU utilization;
+- compare SB3 DQN against a minimal project-local DQN loop if SB3 overhead
+  remains high.
+
+Metrics:
+
+- replay memory per 100k transitions;
+- sampled batches/sec;
+- learner updates/sec;
+- end-to-end fps;
+- single/five-puzzle success at fixed wall-clock budgets.
 
 ## Stage 5: Combined Speedups
 
@@ -157,4 +397,3 @@ Reasoning:
   environment kernels alone may not solve the main wall-clock bottleneck.
 - Structured observations are also required for goal relabeling, making them a
   useful bridge toward the later algorithmic milestone.
-

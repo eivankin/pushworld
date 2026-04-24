@@ -127,8 +127,6 @@
 - https://github.com/julianh65/PufferPushworldExploration - possible PushWorld
   integration with PufferLib/PufferAI. Worth testing as an environment-throughput
   reference.
-- https://github.com/mikkklyubbin/pushworld_rl/ - apparent PPO-based project with
-  checkpoints; useful for implementation ideas but not yet a stable benchmark.
 - https://github.com/Jgroner11/pushworld_bot - barebones bot implementation.
   Could be inspected for ideas, but current scientific value is unclear.
 

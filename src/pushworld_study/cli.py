@@ -5,8 +5,20 @@ from pathlib import Path
 
 import numpy as np
 
-from pushworld_study.baselines import evaluate_baseline, profile_env_steps, train_baseline
+from pushworld_study.baselines import (
+    evaluate_baseline,
+    profile_env_steps,
+    profile_pipeline,
+    train_baseline,
+)
 from pushworld_study.envs import PushWorldGymnasiumEnv
+
+
+def parse_int_list(value: str) -> tuple[int, ...]:
+    parsed = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    if not parsed:
+        raise argparse.ArgumentTypeError("expected at least one integer")
+    return parsed
 
 
 def smoke_env(puzzle_path: Path | None = None, steps: int = 8, seed: int = 0) -> None:
@@ -56,6 +68,30 @@ def main() -> None:
     profile_parser.add_argument("--episodes", type=int, default=10)
     profile_parser.add_argument("--max-steps", type=int, default=100)
     profile_parser.add_argument("--seed", type=int, default=0)
+    profile_parser.add_argument(
+        "--observation-mode",
+        choices=["rgb", "planes"],
+        default="rgb",
+    )
+
+    pipeline_parser = subparsers.add_parser(
+        "profile-pipeline",
+        help="Profile env, observation, prediction, and short training costs.",
+    )
+    pipeline_parser.add_argument("algorithm", choices=["ppo", "dqn"])
+    pipeline_parser.add_argument("--puzzle-path", type=Path, default=None)
+    pipeline_parser.add_argument("--steps", type=int, default=1_000)
+    pipeline_parser.add_argument("--max-steps", type=int, default=100)
+    pipeline_parser.add_argument("--seed", type=int, default=0)
+    pipeline_parser.add_argument("--device", default="cpu")
+    pipeline_parser.add_argument("--predict-iterations", type=int, default=200)
+    pipeline_parser.add_argument("--conversion-iterations", type=int, default=1_000)
+    pipeline_parser.add_argument("--output", type=Path, default=None)
+    pipeline_parser.add_argument(
+        "--observation-mode",
+        choices=["rgb", "planes"],
+        default="rgb",
+    )
 
     train_parser = subparsers.add_parser(
         "train-baseline",
@@ -77,6 +113,15 @@ def main() -> None:
     train_parser.add_argument("--n-steps", type=int, default=128)
     train_parser.add_argument("--batch-size", type=int, default=None)
     train_parser.add_argument("--n-epochs", type=int, default=2)
+    train_parser.add_argument("--features-dim", type=int, default=256)
+    train_parser.add_argument("--vf-coef", type=float, default=None)
+    train_parser.add_argument("--net-arch-pi", type=parse_int_list, default=(128,))
+    train_parser.add_argument("--net-arch-vf", type=parse_int_list, default=(128,))
+    train_parser.add_argument(
+        "--observation-mode",
+        choices=["rgb", "planes"],
+        default="rgb",
+    )
 
     eval_parser = subparsers.add_parser(
         "eval-baseline",
@@ -90,6 +135,11 @@ def main() -> None:
     eval_parser.add_argument("--max-steps", type=int, default=100)
     eval_parser.add_argument("--stochastic", action="store_true")
     eval_parser.add_argument("--device", default="cpu")
+    eval_parser.add_argument(
+        "--observation-mode",
+        choices=["rgb", "planes"],
+        default="rgb",
+    )
 
     args = parser.parse_args()
 
@@ -101,10 +151,29 @@ def main() -> None:
             episodes=args.episodes,
             max_steps=args.max_steps,
             seed=args.seed,
+            observation_mode=args.observation_mode,
         )
         for key, value in metrics.items():
             if isinstance(value, float):
                 print(f"{key}={value:.4f}")
+            else:
+                print(f"{key}={value}")
+    elif args.command == "profile-pipeline":
+        metrics = profile_pipeline(
+            algorithm=args.algorithm,
+            puzzle_path=args.puzzle_path,
+            steps=args.steps,
+            max_steps=args.max_steps,
+            seed=args.seed,
+            observation_mode=args.observation_mode,
+            device=args.device,
+            predict_iterations=args.predict_iterations,
+            conversion_iterations=args.conversion_iterations,
+            output=args.output,
+        )
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                print(f"{key}={value:.6f}")
             else:
                 print(f"{key}={value}")
     elif args.command == "train-baseline":
@@ -125,6 +194,11 @@ def main() -> None:
             n_steps=args.n_steps,
             batch_size=args.batch_size,
             n_epochs=args.n_epochs,
+            observation_mode=args.observation_mode,
+            features_dim=args.features_dim,
+            vf_coef=args.vf_coef,
+            net_arch_pi=args.net_arch_pi,
+            net_arch_vf=args.net_arch_vf,
         )
         print(f"algorithm={result.algorithm}")
         print(f"total_timesteps={result.total_timesteps}")
@@ -139,6 +213,7 @@ def main() -> None:
             max_steps=args.max_steps,
             deterministic=not args.stochastic,
             device=args.device,
+            observation_mode=args.observation_mode,
         )
         print(f"algorithm={result.algorithm}")
         print(f"episodes={result.episodes}")
