@@ -67,6 +67,20 @@ def test_profile_pipeline_smoke(tmp_path) -> None:
     assert output.read_text(encoding="utf-8").strip()
 
 
+def test_profile_pipeline_ppo_timing_smoke() -> None:
+    metrics = profile_pipeline(
+        algorithm="ppo",
+        steps=32,
+        predict_iterations=1,
+        conversion_iterations=1,
+        observation_mode="planes",
+    )
+    assert metrics["ppo_rollout_calls"] >= 1
+    assert metrics["ppo_update_calls"] >= 1
+    assert metrics["ppo_rollout_seconds"] > 0
+    assert metrics["ppo_update_seconds"] > 0
+
+
 def test_dummy_vector_training_env_smoke() -> None:
     env = make_vector_training_env(
         observation_mode="planes",

@@ -348,6 +348,10 @@ Interpretation:
   envs. The main jump is from single-env collection to batched collection.
 - Combined plane observations plus `DummyVecEnv` reaches about `6.8x` speedup at
   4 envs and `9.2x` at 16 envs compared with the vanilla RGB single-env profile.
+- Timed PPO profiling shows why the gain tapers: at 4 envs rollout collection
+  and PPO update are roughly balanced (`50.4%` rollout, `49.6%` update), while
+  at 16 envs rollout drops to `22.5%` and update rises to `77.4%`. Further env
+  parallelism cannot help much unless update time is reduced.
 - These are throughput probes, not learning-quality runs. Increasing `n_envs`
   changes PPO's rollout batch shape (`n_envs * n_steps`), so learning
   comparisons should either keep total rollout size fixed or explicitly treat

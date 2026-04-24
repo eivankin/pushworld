@@ -124,6 +124,18 @@ uv run pushworld-study train-baseline ppo \
   --observation-mode planes
 ```
 
+## Performance Figures
+
+The summary plot below combines the main throughput findings from the profiling
+runs.
+
+![PushWorld performance summary](docs/assets/performance_summary.png)
+
+Plane observations cut PPO's single-env training cost by about `3x`, batched
+planes with `4` to `16` envs push that to roughly `6.8x` to `9.2x` versus the
+vanilla RGB single-env baseline, DQN with planes is much faster than RGB, and
+PPO update time becomes the dominant cost once collection is batched.
+
 ## Baseline Target
 
 The paper's model-free setup is:
