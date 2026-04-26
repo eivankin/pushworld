@@ -2,10 +2,9 @@
 
 This repository is a research workspace for improving RL performance on the
 [DeepMind PushWorld benchmark](https://github.com/google-deepmind/pushworld).
-The initial focus is a faithful PPO/DQN baseline, then a batched/GPU environment
-implementation to measure whether faster simulation improves wall-clock learning.
-
-The original project notes were moved to [notes.md](notes.md).
+The current focus is measurement-first optimization of PPO/DQN baselines:
+compact observations, batching, profiling, compiler-level tuning, and only then
+lower-level simulator work if it is still justified by the bottlenecks.
 
 ## Repository Layout
 
@@ -14,8 +13,8 @@ The original project notes were moved to [notes.md](notes.md).
 - `src/pushworld_study` - local study code, wrappers, training scripts, and
   benchmark utilities.
 - `docs/literature_review.md` - short literature and project survey.
-- `docs/implementation_plan.md` - staged plan for baseline, profiling, and GPU
-  environment work.
+- `docs/optimization_benchmark_plan.md` - staged plan for profiling and
+  optimization experiments.
 
 ## Setup
 
@@ -126,19 +125,30 @@ uv run pushworld-study train-baseline ppo \
 
 ## Performance Figures
 
-The summary plot below combines the main throughput findings from the profiling
-runs.
+The figures below summarize the current findings.
+
+![PushWorld benchmark overview](docs/assets/benchmark_overview.png)
+
+![PushWorld observation modes](docs/assets/observation_modes.png)
+
+![PushWorld bottleneck summary](docs/assets/bottleneck_summary.png)
 
 ![PushWorld performance summary](docs/assets/performance_summary.png)
 
-Plane observations cut PPO's single-env training cost by about `3x`, batched
-planes with `4` to `16` envs push that to roughly `6.8x` to `9.2x` versus the
-vanilla RGB single-env baseline, DQN with planes is much faster than RGB, and
-PPO update time becomes the dominant cost once collection is batched.
+Current findings:
+
+- plane observations cut PPO's single-env throughput cost by about `3x`;
+- batched planes with `4` to `16` envs push PPO to roughly `6.8x` to `9.2x`
+  versus the vanilla RGB single-env baseline;
+- DQN with planes is much faster than RGB, with roughly `20x` throughput gain
+  on the five-puzzle benchmark;
+- PPO and DQN are now mostly learner/update bound, not environment bound;
+- `torch.compile` helps the isolated forward path, but only slightly improves
+  full training throughput.
 
 ## Baseline Target
 
-The paper's model-free setup is:
+The original model-free setup from the paper is:
 
 - algorithms: PPO and DQN;
 - environment: OpenAI Gym wrapper with 100-step episodes;
@@ -151,9 +161,10 @@ The paper's model-free setup is:
 - DQN hyperparameters: learning rate `1e-4`, epsilon `0.05`,
   samples-per-insert `2`, batch size `256`, discount `1.0`, 1-step updates.
 
-The first reproduction should measure throughput and learning on Level 0 before
-moving to Level 1, because the paper reports very low model-free success on
-hand-designed Level 1 puzzles even after 350M steps.
+The benchmark still matters most as a controlled planning/RL testbed, but the
+main study question in this repository is now where the training pipeline spends
+time and which optimizations carry forward to later methods like relabeling,
+sequence models, and hybrid planners.
 
 Current implementation notes:
 
