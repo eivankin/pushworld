@@ -1,0 +1,168 @@
+\documentclass[aspectratio=169]{beamer}
+\usetheme{Madrid}
+\usecolortheme{default}
+
+\usepackage[T2A]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[russian,english]{babel}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{animate}
+
+\title{Промежуточный отчёт по PushWorld}
+\subtitle{Оптимизационный анализ пайплайна обучения}
+\author{Иванкин Евгений, Сулиман Адам}
+\date{}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{Что такое PushWorld}
+  \centering
+  \includegraphics[height=0.54\textheight]{../assets/benchmark_overview.png}
+
+  \vspace{0.6em}
+  \begin{itemize}
+    \item PushWorld --- planning benchmark: агент двигается по сетке и толкает объекты в целевые позиции.
+    \item На сложных уровнях появляются инструменты, узкие проходы и длинные причинно-следственные цепочки.
+    \item Для нас это удобный тест на то, где RL-пайплайн ломается по времени и по качеству.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Как выглядит решение в среде}
+  \begin{columns}[T]
+    \column{0.50\textwidth}
+    \centering
+    \animategraphics[autoplay,loop,width=0.84\linewidth]{3}{../assets/rollout_success/frame_}{000}{002}
+
+    \column{0.50\textwidth}
+    \centering
+    \animategraphics[autoplay,loop,width=0.84\linewidth]{6}{../assets/rollout_fail/frame_}{000}{040}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{Бейзлайны слабые и медленные}
+  \begin{itemize}
+    \item PPO на RGB оказался нестабильным даже на 5 простых головоломках.
+    \item DQN на том же наборе вел себя устойчивее, но работал очень медленно.
+    \item Это были короткие прогоны порядка 100--200k итераций: по качеству это ещё не финальный вердикт, но слабость бейзлайнов уже видна.
+    \item Для этого checkpoint важнее именно системный сигнал: куда уходит время и какой FPS даёт каждая конфигурация.
+  \end{itemize}
+
+  \vspace{0.9em}
+  \centering
+  \normalsize
+  \begin{tabular}{@{}p{0.60\linewidth}cc@{}}
+    \toprule
+    Конфигурация & FPS & Успех \\
+    \midrule
+    PPO, RGB, 5 головоломок & 195 & 15\% \\
+    DQN, RGB, 5 головоломок & 8 & 40\% \\
+    \bottomrule
+  \end{tabular}
+\end{frame}
+
+\begin{frame}{Что видит агент: RGB против planes}
+  \centering
+  \includegraphics[height=0.55\textheight]{../assets/observation_modes.png}
+
+  \vspace{0.3em}
+  \small
+  \begin{itemize}
+    \item RGB требует рендерить большую картинку и гонять большие тензоры через replay/CNN.
+    \item Plane-наблюдения оставляют только полезную структуру состояния.
+    \item Ключевые числа: размер состояния 58{,}800 B \(\rightarrow\) 1{,}176 B; PPO 195 \(\rightarrow\) 586 FPS; DQN 8 \(\rightarrow\) 161.7 FPS.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{После planes среда уже не главный bottleneck}
+  \centering
+  \includegraphics[height=0.50\textheight]{../assets/bottleneck_summary.png}
+
+  \vspace{0.4em}
+  \begin{itemize}
+    \item PPO, RGB: среда занимает \textbf{11.15\%} train time. PPO, planes: только \textbf{1.29\%}.
+    \item PPO, planes + 16 envs: \textbf{77.4\%} времени уже уходит в update. DQN, planes: среда занимает всего \textbf{0.38\%}, update --- \textbf{76.0\%}.
+    \item Итог: сейчас главный bottleneck --- не симуляция среды, а learner/update stack. Поэтому переписывать среду на GPU прямо сейчас преждевременно.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Ещё одна оптимизация: \texttt{torch.compile}}
+  \begin{columns}[T]
+    \column{0.54\textwidth}
+    \begin{itemize}
+      \item Мы проверили уже не только representation-level оптимизации, но и model-side оптимизацию.
+      \item \texttt{torch.compile} заметно ускоряет чистый forward pass.
+      \item Но end-to-end training step ускоряется совсем слабо.
+      \item Значит, оставшийся bottleneck шире, чем просто скорость инференса.
+    \end{itemize}
+
+    \column{0.46\textwidth}
+    \centering
+    \begin{tabular}{@{}lccc@{}}
+      \toprule
+      Batch & Метрика & Eager & Compile \\
+      \midrule
+      256 & Infer/s & 1055.6 & 1643.6 \\
+      256 & Train/s & 345.7 & 359.1 \\
+      512 & Infer/s & 614.5 & 878.7 \\
+      512 & Train/s & 201.6 & 208.3 \\
+      \bottomrule
+    \end{tabular}
+
+    \vspace{0.5em}
+    \small
+    Ускорение inference: \textbf{1.43x--1.56x}\\
+    Ускорение training: только \textbf{1.03x--1.04x}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{Что дальше}
+  \scriptsize
+  \begin{block}{Ближайший шаг 1}
+    \textbf{Goal-conditioned observations + relabeling \hyperlink{ref:her}{[1]}.}
+    Это прямой способ решить проблему sparse-reward, сохраняя уже быстрый plane-pipeline.
+  \end{block}
+
+  \begin{block}{Ближайший шаг 2}
+    \textbf{AMP, настройка update-параметров, более детальный profiling.}
+    Это логично, потому что и PPO, и DQN уже упираются не в среду, а в update-часть обучения.
+  \end{block}
+
+  \begin{block}{Среднесрочно}
+    \textbf{Transformer policy на траекториях планировщика \hyperlink{ref:wheeler}{[2]}.}
+    Для planning benchmark sequence-модель выглядит здесь естественно.
+  \end{block}
+
+  \begin{block}{Долгосрочно}
+    \textbf{Гибридный solver: planner + learned executor \hyperlink{ref:follow}{[3]}.}
+    Планировщик может задавать порядок подзадач, subgoals или грубый план, а политика --- устойчиво исполнять локальные шаги между ними.
+  \end{block}
+\end{frame}
+
+\begin{frame}{Источники и ориентиры}
+  \small
+  \begin{itemize}
+    \item \hypertarget{ref:her}{}\textbf{[1]} M. Andrychowicz et al. \textit{Hindsight Experience Replay}. NeurIPS, 2017.
+    
+    \href{https://arxiv.org/abs/1707.01495}{arxiv.org/abs/1707.01495}
+    \hfill \hyperlink{page.8}{\beamerbutton{к плану}}
+
+    \item \hypertarget{ref:wheeler}{}\textbf{[2]} T. Wheeler. Серия материалов о Sokoban, sequence modeling и GPU rollout.
+    
+    \href{https://timallanwheeler.com/blog/category/sokoban/}{timallanwheeler.com/blog/category/sokoban/}
+    \hfill \hyperlink{page.8}{\beamerbutton{к плану}}
+
+    \item \hypertarget{ref:follow}{}\textbf{[3]} \textit{Learn to Follow: Decentralized Lifelong Multi-agent Pathfinding via Planning and Learning}, 2023.
+    
+    \href{https://arxiv.org/abs/2310.01207}{arxiv.org/abs/2310.01207}
+    \hfill \hyperlink{page.8}{\beamerbutton{к плану}}
+  \end{itemize}
+
+\end{frame}
+
+\end{document}

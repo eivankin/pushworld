@@ -69,6 +69,52 @@ Measurements still to add later:
 - eval callback wall time;
 - GPU memory, if readable outside the sandbox.
 
+Observed DQN timing split after adding the first timing hooks on
+`data/debug/base_train_5` with plane observations:
+
+- `train_steps_per_second`: `173.3`
+- `dqn_rollout_fraction`: `23.8%`
+- `dqn_update_fraction`: `76.0%`
+- separately measured environment work: `0.38%` of train time
+
+Interpretation:
+
+- after removing RGB rendering and replay-size overhead, DQN is also primarily
+  learner/update bound rather than env bound;
+- further environment-side optimization is unlikely to move wall-clock training
+  much for the current DQN baseline;
+- future DQN optimization should focus on replay/update efficiency, mixed
+  precision, compiler availability, or smaller/cheaper model paths.
+
+Observed `torch.compile` microbenchmark on CUDA for the PushWorld CNN policy
+head with plane observations and batch `256`:
+
+- eager inference: `1055.6` steps/s
+- compiled inference: `1643.6` steps/s
+- inference speedup: `1.56x`
+- eager train step: `345.7` steps/s
+- compiled train step: `359.1` steps/s
+- train-step speedup: `1.04x`
+
+Interpretation:
+
+- compiler optimization helps the isolated forward path materially;
+- it barely changes end-to-end training-step throughput;
+- this matches the broader profiler story that current learner overhead is not
+  just the raw model forward pass.
+
+Follow-up at batch `512` showed the same qualitative result:
+
+- eager inference: `614.5` steps/s
+- compiled inference: `878.7` steps/s
+- inference speedup: `1.43x`
+- eager train step: `201.6` steps/s
+- compiled train step: `208.3` steps/s
+- train-step speedup: `1.03x`
+
+This makes the result more robust: compilation is a real forward-pass win, but
+it is still not the main lever for end-to-end learner throughput on this setup.
+
 Output format:
 
 - write one JSONL row per measurement window;

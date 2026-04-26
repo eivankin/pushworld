@@ -171,6 +171,7 @@ def make_model(
     net_arch_pi: tuple[int, ...] = (128,),
     net_arch_vf: tuple[int, ...] = (128,),
     ppo_cls=None,
+    dqn_cls=None,
 ):
     _require_sb3()
 
@@ -198,8 +199,9 @@ def make_model(
         )
 
     if algorithm == "dqn":
+        dqn_model_cls = DQN if dqn_cls is None else dqn_cls
         kwargs["net_arch"] = [128]
-        return DQN(
+        return dqn_model_cls(
             "CnnPolicy",
             env,
             learning_rate=1e-4 if learning_rate is None else learning_rate,
@@ -604,6 +606,7 @@ def _profile_short_training(
         _configure_cpu_runtime()
 
     ppo_cls = None
+    dqn_cls = None
     if algorithm == "ppo":
         from stable_baselines3 import PPO
 
@@ -630,6 +633,32 @@ def _profile_short_training(
                     self.update_calls += 1
 
         ppo_cls = TimedPPO
+    if algorithm == "dqn":
+        from stable_baselines3 import DQN
+
+        class TimedDQN(DQN):
+            rollout_seconds = 0.0
+            update_seconds = 0.0
+            rollout_calls = 0
+            update_calls = 0
+
+            def collect_rollouts(self, *args, **kwargs):
+                started_at = time.perf_counter()
+                try:
+                    return super().collect_rollouts(*args, **kwargs)
+                finally:
+                    self.rollout_seconds += time.perf_counter() - started_at
+                    self.rollout_calls += 1
+
+            def train(self, gradient_steps: int, batch_size: int = 100) -> None:
+                started_at = time.perf_counter()
+                try:
+                    return super().train(gradient_steps=gradient_steps, batch_size=batch_size)
+                finally:
+                    self.update_seconds += time.perf_counter() - started_at
+                    self.update_calls += 1
+
+        dqn_cls = TimedDQN
 
     env = make_vector_training_env(
         puzzle_path=puzzle_path,
@@ -648,6 +677,7 @@ def _profile_short_training(
         n_steps=min(128, train_steps) if algorithm == "ppo" else 128,
         batch_size=32 if algorithm == "ppo" else None,
         ppo_cls=ppo_cls,
+        dqn_cls=dqn_cls,
     )
 
     started_at = time.perf_counter()
@@ -675,6 +705,19 @@ def _profile_short_training(
                 "ppo_update_calls": int(getattr(model, "update_calls", 0)),
                 "ppo_rollout_fraction": rollout_seconds / elapsed_seconds,
                 "ppo_update_fraction": update_seconds / elapsed_seconds,
+            }
+        )
+    if algorithm == "dqn":
+        rollout_seconds = float(getattr(model, "rollout_seconds", 0.0))
+        update_seconds = float(getattr(model, "update_seconds", 0.0))
+        metrics.update(
+            {
+                "dqn_rollout_seconds": rollout_seconds,
+                "dqn_update_seconds": update_seconds,
+                "dqn_rollout_calls": int(getattr(model, "rollout_calls", 0)),
+                "dqn_update_calls": int(getattr(model, "update_calls", 0)),
+                "dqn_rollout_fraction": rollout_seconds / elapsed_seconds,
+                "dqn_update_fraction": update_seconds / elapsed_seconds,
             }
         )
     return metrics

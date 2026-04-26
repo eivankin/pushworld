@@ -79,6 +79,21 @@
   Pastukhov, 2025: https://arxiv.org/abs/2504.04366. Relevance for PushWorld:
   modern example of learned subgoal decomposition applied to Boxoban/Sokoban,
   directly aligned with the optional goal-conditioned/relabeling direction.
+- Learn to Follow: Decentralized Lifelong Multi-agent Pathfinding via Planning
+  and Learning, Skrynnik et al., 2023/2024:
+  https://arxiv.org/abs/2310.01207. Relevance for PushWorld: strong example of
+  a hybrid pipeline where heuristic planning provides long-range structure and a
+  learned policy handles local adaptation. The task is not the same as
+  PushWorld, but the decomposition is highly relevant.
+- Tim Wheeler, "A Transformer Sokoban Policy":
+  https://timallanwheeler.com/blog/category/sokoban/. Relevance for PushWorld:
+  practical example of training a goal-conditioned sequence policy with
+  teacher forcing and evaluating it through beam search rather than plain RL
+  reward curves.
+- Tim Wheeler, "Rollouts on the GPU":
+  https://timallanwheeler.com/blog/category/sokoban/. Relevance for PushWorld:
+  concrete systems example showing that once a policy runs on GPU, rollout can
+  still remain bottlenecked by CPU state advancement and CPU<->GPU transfers.
 
 ### Relevant Directions to Compare Against
 
@@ -140,3 +155,15 @@ baseline table with:
 - profile breakdown of stepping/rendering/training;
 - a clear decision on whether a GPU environment is likely to move wall-clock
   learning speed.
+
+## Transformer-Policy Follow-Up
+
+See [transformer_policy_notes.md](transformer_policy_notes.md) for a more
+concrete assessment of whether a Sokoban-style transformer policy plus search is
+worth implementing for PushWorld. The short version is yes, but only as a new
+offline planning pipeline rather than as a direct SB3 PPO replacement.
+
+See [hybrid_solver_notes.md](hybrid_solver_notes.md) for a complementary note on
+hybrid planning+learning approaches in the style of FOLLOWER. The short version
+is that this looks promising for PushWorld as a medium-to-long-term direction,
+especially after we have goal-conditioned observations and relabeling.

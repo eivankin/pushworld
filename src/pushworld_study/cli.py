@@ -12,6 +12,7 @@ from pushworld_study.baselines import (
     train_baseline,
 )
 from pushworld_study.envs import PushWorldGymnasiumEnv
+from pushworld_study.model_benchmarks import benchmark_model_compile
 
 
 def parse_int_list(value: str) -> tuple[int, ...]:
@@ -95,6 +96,24 @@ def main() -> None:
         default="rgb",
     )
 
+    compile_parser = subparsers.add_parser(
+        "benchmark-model-compile",
+        help="Benchmark eager vs torch.compile on the PushWorld CNN policy head.",
+    )
+    compile_parser.add_argument("--puzzle-path", type=Path, default=None)
+    compile_parser.add_argument("--device", default="cpu")
+    compile_parser.add_argument("--batch-size", type=int, default=256)
+    compile_parser.add_argument("--iterations", type=int, default=200)
+    compile_parser.add_argument("--warmup", type=int, default=30)
+    compile_parser.add_argument("--features-dim", type=int, default=256)
+    compile_parser.add_argument("--compile-mode", default="default")
+    compile_parser.add_argument("--fullgraph", action="store_true")
+    compile_parser.add_argument(
+        "--observation-mode",
+        choices=["rgb", "planes"],
+        default="planes",
+    )
+
     train_parser = subparsers.add_parser(
         "train-baseline",
         help="Run a short SB3 PPO/DQN smoke-training baseline.",
@@ -176,6 +195,23 @@ def main() -> None:
             n_envs=args.n_envs,
             vec_env=args.vec_env,
             output=args.output,
+        )
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                print(f"{key}={value:.6f}")
+            else:
+                print(f"{key}={value}")
+    elif args.command == "benchmark-model-compile":
+        metrics = benchmark_model_compile(
+            puzzle_path=args.puzzle_path,
+            observation_mode=args.observation_mode,
+            device=args.device,
+            batch_size=args.batch_size,
+            iterations=args.iterations,
+            warmup=args.warmup,
+            features_dim=args.features_dim,
+            compile_mode=args.compile_mode,
+            fullgraph=args.fullgraph,
         )
         for key, value in metrics.items():
             if isinstance(value, float):

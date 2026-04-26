@@ -6,6 +6,7 @@ from pushworld_study.baselines import (
     profile_pipeline,
 )
 from pushworld_study.envs import make_pushworld_env
+from pushworld_study.model_benchmarks import benchmark_model_compile
 
 
 def test_channel_first_env_shape() -> None:
@@ -81,6 +82,20 @@ def test_profile_pipeline_ppo_timing_smoke() -> None:
     assert metrics["ppo_update_seconds"] > 0
 
 
+def test_profile_pipeline_dqn_timing_smoke() -> None:
+    metrics = profile_pipeline(
+        algorithm="dqn",
+        steps=128,
+        predict_iterations=1,
+        conversion_iterations=1,
+        observation_mode="planes",
+    )
+    assert metrics["dqn_rollout_calls"] >= 1
+    assert metrics["dqn_update_calls"] >= 1
+    assert metrics["dqn_rollout_seconds"] > 0
+    assert metrics["dqn_update_seconds"] > 0
+
+
 def test_dummy_vector_training_env_smoke() -> None:
     env = make_vector_training_env(
         observation_mode="planes",
@@ -90,3 +105,22 @@ def test_dummy_vector_training_env_smoke() -> None:
     observation = env.reset()
     assert observation.shape[0] == 2
     env.close()
+
+
+def test_benchmark_model_compile_smoke() -> None:
+    metrics = benchmark_model_compile(
+        observation_mode="planes",
+        device="cpu",
+        batch_size=4,
+        iterations=2,
+        warmup=1,
+    )
+    assert metrics["observation_mode"] == "planes"
+    assert metrics["batch_size"] == 4
+    assert metrics["eager_infer_steps_per_second"] > 0
+    assert metrics["eager_train_steps_per_second"] > 0
+    if metrics["compile_success"] == 1:
+        assert metrics["compiled_infer_steps_per_second"] > 0
+        assert metrics["compiled_train_steps_per_second"] > 0
+    else:
+        assert metrics["compile_error"]
