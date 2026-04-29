@@ -176,3 +176,7 @@ These low-level results are not specific to current PPO only.
   evaluation.
 - Offline transformer policies may shift the exact bottleneck, but the
   measurement-first approach remains the same.
+- RAGEN-style LLM-agent pipelines shift the bottleneck again toward token
+  generation, rollout batching, Ray/vLLM scheduling, and LoRA/update cost. The
+  same profiling discipline should be applied there, with tokens/sec and
+  time-to-target-success added to the metrics.

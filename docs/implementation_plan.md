@@ -56,29 +56,83 @@ Current baseline limitations:
 - Treat Acme/JAX as the exact-reproduction option if SB3 results diverge for
   reasons that matter scientifically.
 
-## Milestone 3: GPU Environment Prototype
+## Milestone 3: Current RL Pipeline Optimization
 
-- Avoid RGB rendering in the first GPU prototype.
-- Represent each puzzle as fixed-shape integer tensors:
-  - grid occupancy;
-  - object ids;
-  - object shapes;
-  - goal mask;
-  - agent/object positions;
-  - done flags and step counts.
-- Prototype kernels in Numba or Triton:
-  - collision checks;
-  - push dynamics;
-  - goal-count updates;
-  - batched random action stepping for throughput tests.
-- Validate against the official Python environment on selected puzzles before
-  using it for learning.
-
-## Milestone 4: Optional Goal Relabeling
-
+- Keep plane observations as the default training representation.
+- Add goal-conditioned plane observations:
+  - current-state planes;
+  - goal/subgoal planes;
+  - optional achieved-goal indicators.
 - Define achieved goals from object positions reached during failed episodes.
 - Log both original-task and relabeled-task returns.
-- Compare vanilla vs relabeled pipelines with both official and accelerated envs.
+- Compare vanilla vs relabeled pipelines on success/time and update seconds per
+  `100k` env steps.
+- Add finer learner/update profiling:
+  - dataloader/replay sampling;
+  - policy forward/backward;
+  - optimizer step;
+  - host-device transfer if visible.
+- Test AMP, rollout length, minibatch size, update epochs, and replay/buffer
+  layout as separate optimization variables.
+
+## Milestone 4: Transformer Policy Pipeline
+
+- Export planner trajectories into an offline dataset:
+  `(goal, state_t, action_t, state_{t+1}, remaining_distance)`.
+- Cache plane tensors so supervised training does not wait on parsing or
+  environment stepping.
+- Implement model ladder:
+  - CNN-only no-history baseline;
+  - CNN encoder + transformer over the last `k` states;
+  - action head plus bucketed distance/solvability head.
+- Evaluate action accuracy, greedy solve rate, beam-search solve rate, and
+  states/sec during search.
+- Optimize dataloader throughput, AMP / `torch.compile`, larger batches,
+  batched beam-candidate scoring, and repeated state/logit caching.
+
+## Milestone 5: Hybrid Planner + Learned Executor
+
+- Build planner-derived subgoal traces from existing solution trajectories.
+- Train a goal-conditioned local executor on Level 0 subgoals with imitation
+  and/or relabeling.
+- Add a minimal runtime interface:
+  current state, planner-produced subgoal, executor action, progress monitor,
+  and replan trigger.
+- Profile planner call time, executor inference time, env stepping, and
+  replanning overhead separately.
+- Compare planner-only, executor-only, hybrid without learned ranker, and hybrid
+  with learned ranker/value model.
+
+## Milestone 6: RAGEN LLM-Agent Pipeline
+
+- Adapt PushWorld as a RAGEN-compatible text environment:
+  - Gym wrapper;
+  - deterministic ASCII/text state renderer;
+  - strict action parser;
+  - reward/success adapter.
+- Run a fixed-prompt no-finetune baseline for at least `256` eval episodes and
+  store full trajectory logs.
+- If the baseline is non-empty, run a small LoRA/StarPO experiment on a Level 0
+  split.
+- Profile wall time, tokens/sec, tokens/episode, env-step time, generation time,
+  update time, and GPU memory.
+- Optimize prompt compression, reasoning-token caps, one-token action answers,
+  vLLM rollout batching, Ray worker and env placement, no-finetune vs LoRA vs
+  full update, and high-signal rollout filtering.
+
+## Deferred: GPU Environment Prototype
+
+GPU environment work is no longer the immediate next milestone for current
+PPO/DQN baselines because plane observations and vectorized PPO have shifted the
+short-run bottleneck to learner/update time. It remains relevant if later
+search/rollout pipelines become synchronization-bound.
+
+- Avoid RGB rendering in a GPU prototype.
+- Represent each puzzle as fixed-shape integer tensors.
+- Start with PyTorch tensor transitions before Numba/Triton kernels.
+- Validate against the official Python environment before using it for learning.
+- Require end-to-end speedup, not just transition-only speedup, before replacing
+  the official environment.
 
 ## Experiment Metrics
 

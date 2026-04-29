@@ -110,7 +110,10 @@ longer PPO runs, the likely improvements are:
 - curriculum learning from single-puzzle/few-puzzle subsets;
 - better evaluation/checkpointing split for deterministic vs stochastic policy
   behavior;
-- possibly recurrent policies or search-guided/hybrid methods.
+- transformer policy from planner trajectories;
+- hybrid planner + learned executor;
+- RAGEN-style LLM-agent pipeline as a separate heavy-pipeline optimization
+  branch, not as a PPO replacement.
 
 ## Next Baseline: DQN
 
@@ -218,8 +221,9 @@ frequent evaluation:
 - The paper's qualitative observation that DQN may generalize more stably than
   PPO is consistent with our early debug results, although our setup is not an
   exact Acme/JAX reproduction.
-- The next milestone should focus on training-pipeline speed and observation
-  representation, not longer runs of the current pixel baselines.
+- The next milestone should focus on the current plane pipeline:
+  goal-conditioned observations, relabeling, and learner/update profiling, not
+  longer runs of the current pixel baselines.
 
 ## Plane Observation Mode
 
@@ -291,4 +295,5 @@ Practical implication:
   larger-head/high-entropy PPO variant performed worse than our default plane
   PPO run.
 - More useful next steps are vectorized collection, structured observations,
-  deterministic-vs-stochastic checkpointing, and eventually goal relabeling.
+  deterministic-vs-stochastic checkpointing, goal relabeling, and the separate
+  transformer/hybrid/RAGEN pipeline branches described in the planning notes.

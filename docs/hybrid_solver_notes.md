@@ -200,6 +200,52 @@ to evaluate.
    - planner alone;
    - transformer policy + beam search.
 
+## Optimization Plan
+
+The presentation frames this as:
+
+`current state -> planner subgoals -> goal-conditioned executor -> progress
+monitor -> accept or replan`.
+
+Concrete implementation and optimization steps:
+
+1. Slice existing solution traces into reachable partial goals every `k`
+   actions. Store the current state, subgoal state, action segment, and distance
+   to the subgoal.
+2. Train an executor baseline on Level 0 subgoals:
+   - imitation from planner segments;
+   - relabeling from partially successful attempts;
+   - goal-conditioned plane observations.
+3. Profile the runtime interface before making it more complex:
+   - planner call time;
+   - executor inference time;
+   - environment stepping time;
+   - progress-monitor time;
+   - replanning overhead.
+4. Reduce planner calls:
+   - cache subgoal plans;
+   - replan only on timeout;
+   - replan when distance-to-subgoal regresses for several steps;
+   - keep a short blacklist of recently failed subgoals.
+5. Add a learned ranker/value only after the simple hybrid runs:
+   - planner proposes several candidate subgoals or prefixes;
+   - model ranks candidates;
+   - executor follows the selected candidate.
+6. Run ablations:
+   - planner-only;
+   - executor-only;
+   - hybrid without ranker;
+   - hybrid with ranker/value.
+
+Metrics:
+
+- subgoal success rate;
+- replans per puzzle;
+- planner time vs executor time;
+- solved puzzles per minute;
+- wall-clock per solved puzzle;
+- failure modes by subgoal type.
+
 ## Bottom Line
 
 The FOLLOWER idea is relevant to PushWorld not because the tasks are identical,

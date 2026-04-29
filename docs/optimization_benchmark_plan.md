@@ -407,76 +407,23 @@ Stop condition: if 8-16 CPU envs saturate PPO training and give acceptable fps,
 GPU environment work should wait until Level 1 or larger batched experiments
 need it.
 
-## Stage 4: GPU/Compiled Transition Prototype
+## Stage 4: Learner/Replay Optimizations
 
-Only after compact observations and CPU vectorization are measured:
-
-- define a dense tensor state representation:
-  - static planes: walls, agent-only walls, goal cells;
-  - dynamic planes: agent, movable object occupancy, object-goal ids if needed;
-  - per-env metadata: step count, solved flag, active puzzle id;
-- implement batched transition for a restricted Level 0 base representation;
-- start with PyTorch tensor ops on GPU before writing custom kernels;
-- if PyTorch ops are too slow, try Numba CUDA or Triton kernels;
-- validate transition equivalence against official `PushWorldPuzzle` on sampled
-  states;
-- then extend to multi-cell shapes, walls, obstacles, and higher levels.
-
-Measure:
-
-- transition-only steps/sec;
-- end-to-end learner fps;
-- validation mismatch rate;
-- engineering complexity.
-
-Validation suite:
-
-- generate random legal states from official env resets plus random rollouts;
-- replay the same actions through official env and GPU env;
-- compare reward, terminated/truncated flags, agent position, object positions,
-  and rendered plane observations;
-- run at least 10k random transitions per supported puzzle family before using
-  the GPU env for training.
-
-Prototype ladder:
-
-1. CPU tensor reference implementation using the same dense representation.
-2. GPU PyTorch implementation with batch size 1,024+.
-3. Custom kernel only if PyTorch GPU ops leave transition time dominant.
-4. SB3-compatible vector env wrapper.
-5. Native learner integration if SB3 wrapper overhead becomes dominant.
-
-Hypothesis: GPU env stepping will help most on large batches and complex puzzle
-sets, but may not dominate end-to-end training until observation/replay overhead
-is reduced.
-
-Risks:
-
-- exact PushWorld collision/object-shape semantics may be harder to reproduce
-  than the Level 0 base case suggests;
-- SB3 vector-env APIs may erase much of the GPU transition speedup through CPU
-  synchronization;
-- GPU envs are more valuable for PPO-style large-batch collection than for DQN
-  if replay/model updates remain the bottleneck.
-
-Decision gate: do not replace the official env until equivalence tests pass and
-end-to-end PPO fps improves by at least 2x over vectorized CPU planes.
-
-## Stage 4.5: Learner/Replay Optimizations
-
-The DQN result suggests learner and replay overhead can dominate once RGB is
-removed. These changes should be benchmarked separately from environment
+The DQN/PPO timing splits show that learner and replay overhead can dominate
+once RGB is removed. These changes should be benchmarked before environment
 kernels:
 
+- add fine-grained update timing for replay sampling, tensor transfer,
+  forward/backward, and optimizer step;
 - store plane observations as `uint8`/bool in replay and cast on batch load;
 - reduce replay copies by preallocating contiguous arrays;
 - test smaller CNNs for 6-plane inputs;
-- test MLP over object-table features for Level 0 base;
-- use larger batches only after checking GPU utilization;
+- test AMP on policy updates;
+- sweep rollout length, minibatch size, and update epochs for PPO;
 - compare SB3 DQN against a minimal project-local DQN loop if SB3 overhead
   remains high.
 
-Metrics:
+Measure:
 
 - replay memory per 100k transitions;
 - sampled batches/sec;
@@ -484,14 +431,143 @@ Metrics:
 - end-to-end fps;
 - single/five-puzzle success at fixed wall-clock budgets.
 
-## Stage 5: Combined Speedups
+## Stage 5: Goal-Conditioned Relabeling Pipeline
+
+Add goal-conditioned observations to the existing plane pipeline before moving
+to more expensive planner/LLM systems.
+
+Implementation targets:
+
+- current-state planes plus goal/subgoal planes;
+- achieved-goal extraction from failed trajectories;
+- relabeled replay/rollout records;
+- evaluation under original goals and relabeled training goals.
+
+Measure:
+
+- success/time;
+- update seconds per 100k env steps;
+- original-task success rate;
+- relabeled-task success rate;
+- effect on deterministic vs stochastic policy collapse.
+
+## Stage 6: Transformer Policy Pipeline
+
+Pipeline:
+
+- planner solutions;
+- state-action dataset;
+- plane encoder + transformer over recent states;
+- action head and distance/solvability head;
+- greedy rollout and beam search.
+
+Optimization steps:
+
+1. export planner traces and cache plane tensors;
+2. train CNN-only no-history baseline;
+3. add transformer over the last `k` states;
+4. add bucketed distance/solvability head;
+5. optimize dataloader, AMP, `torch.compile`, and batch size;
+6. benchmark greedy rollout;
+7. benchmark beam widths `8`, `16`, `32`;
+8. batch all beam-candidate scoring in one forward pass;
+9. cache repeated state/logit evaluations.
+
+Metrics:
+
+- action accuracy;
+- greedy solve rate;
+- beam solve rate;
+- states/sec during search;
+- GPU utilization;
+- wall-clock per solved puzzle.
+
+## Stage 7: Hybrid Solver Pipeline
+
+Pipeline:
+
+- current state;
+- planner-produced subgoal or short solution prefix;
+- goal-conditioned executor;
+- progress monitor;
+- accept/replan decision.
+
+Optimization steps:
+
+1. slice solution traces into reachable partial goals every `k` actions;
+2. train executor with imitation and/or relabeling on Level 0 subgoals;
+3. profile planner call time, executor inference, env stepping, and replanning;
+4. cache planner subgoals;
+5. replan only on timeout or distance-to-subgoal regression;
+6. add learned ranker/value for planner candidates.
+
+Metrics:
+
+- subgoal success;
+- replans per puzzle;
+- planner time vs executor time;
+- solved puzzles per minute;
+- ablations: planner-only, executor-only, hybrid without ranker, hybrid with
+  ranker.
+
+## Stage 8: RAGEN LLM-Agent Pipeline
+
+Pipeline:
+
+- PushWorld Gym/text wrapper;
+- deterministic text state + prompt;
+- LLM reasoning/action generation;
+- trajectory reward;
+- StarPO/LoRA update.
+
+Baseline and optimization steps:
+
+1. fixed prompt, no fine-tune, at least `256` eval episodes;
+2. log full trajectories and parse failures;
+3. profile wall time, tokens/sec, tokens/episode, env-step time, generation
+   time, update time, and GPU memory;
+4. compare verbose text state vs compact ASCII planes;
+5. cap reasoning tokens and require one-token action answers;
+6. batch `P` initial states by `N` samples per state through vLLM;
+7. tune Ray workers and env placement;
+8. compare no-finetune, LoRA, and full update;
+9. add high-signal rollout filtering.
+
+The RAGEN paper provides runtime/resource context, but not a complete
+throughput benchmark table. Treat the paper's Sokoban PPO total-time plots,
+H100/A100 + vLLM/Ray/FSDP setup, and LoRA resource comparison as reference
+points rather than final targets.
+
+Metrics:
+
+- prompt-only success;
+- time-to-target success;
+- tokens per solved puzzle;
+- GPU memory;
+- rollout generation fraction vs update fraction;
+- LoRA/full-update quality-time trade-off.
+
+## Deferred Stage: GPU/Compiled Transition Prototype
+
+GPU env stepping is deferred until a later pipeline makes transition/search
+state propagation the dominant bottleneck.
+
+- define a dense tensor state representation;
+- implement batched transition for a restricted Level 0 base representation;
+- start with PyTorch tensor ops on GPU before writing custom kernels;
+- validate transition equivalence against official `PushWorldPuzzle`;
+- replace the official env only after equivalence tests pass and end-to-end
+  speed improves materially over vectorized CPU planes.
+
+## Combined Speedups
 
 Once individual speedups are measured, combine:
 
 1. structured observations;
 2. vectorized env stepping;
 3. optimized replay/model;
-4. compiled/GPU transitions.
+4. goal-conditioned relabeling;
+5. planning/LLM pipeline-specific inference optimizations.
 
 Report:
 
@@ -503,7 +579,8 @@ Report:
 
 ## Recommended Next Implementation
 
-Start with instrumentation and structured observations, not GPU kernels.
+Start with instrumentation, structured observations, and goal-conditioned
+relabeling, not GPU kernels.
 
 Reasoning:
 

@@ -251,6 +251,48 @@ systems story:
    - beam search with width `8`, `16`, `32`.
 5. Only after that, consider GPU rollout/search kernels.
 
+## Optimization Plan
+
+The presentation frames this as a separate pipeline:
+
+`planner solutions -> state-action dataset -> plane encoder + transformer ->
+action/distance heads -> greedy or beam search`.
+
+Concrete optimization steps:
+
+1. Export planner traces once and cache plane tensors on disk. Training should
+   not wait on parser, simulator, or renderer work.
+2. Train a CNN-only no-history baseline before adding the transformer. This
+   isolates the value of sequence context.
+3. Add a transformer over the last `k` states and sweep `k` before increasing
+   model size.
+4. Add the bucketed distance/solvability head and measure whether it improves
+   beam-search ranking, not just validation loss.
+5. Optimize the supervised training loop:
+   - fixed-shape batches where possible;
+   - dataloader prefetching;
+   - AMP;
+   - `torch.compile`;
+   - larger batches until GPU utilization or validation quality stops
+     improving.
+6. Optimize search separately:
+   - greedy rollout baseline;
+   - beam widths `8`, `16`, `32`;
+   - one batched forward pass for all beam candidates;
+   - cache repeated state encodings, logits, and distance-head outputs.
+7. Stop increasing beam width when search time grows faster than solve rate.
+   At that point the better target is the ranking/value head, not more search.
+
+Metrics:
+
+- action accuracy;
+- distance/solvability accuracy;
+- greedy solve rate;
+- beam solve rate;
+- states/sec during search;
+- wall-clock per solved puzzle;
+- GPU utilization.
+
 ## Bottom Line
 
 Using a Wheeler-style transformer policy on PushWorld is possible, but it

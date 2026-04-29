@@ -94,6 +94,23 @@
   https://timallanwheeler.com/blog/category/sokoban/. Relevance for PushWorld:
   concrete systems example showing that once a policy runs on GPU, rollout can
   still remain bottlenecked by CPU state advancement and CPU<->GPU transfers.
+- RAGEN: Understanding Self-Evolution in LLM Agents via Multi-Turn
+  Reinforcement Learning, Wang et al., 2025:
+  https://arxiv.org/abs/2504.20073; code:
+  https://github.com/mll-lab-nu/RAGEN. RAGEN is a multi-turn RL framework for
+  LLM agents: the model receives a text state, produces reasoning and an action,
+  the environment returns feedback/reward, and the policy is updated from
+  trajectory-level outcomes. The repository includes Sokoban-style tasks and
+  Gym-compatible custom environments, which makes PushWorld adaptation
+  realistic through a text renderer, action parser, and Gym wrapper. Relevance
+  for PushWorld: RAGEN is not a fastest-solver target; it is a useful heavy
+  LLM-agent pipeline to adapt and optimize. Concrete optimization targets are
+  prompt/context length, reasoning-token budget, vLLM rollout batching,
+  Ray/environment placement, LoRA vs full update cost, and rollout filtering.
+  The paper reports runtime/resource context rather than a complete throughput
+  table: Figure 5 gives Sokoban PPO total-time plots for filtering variants,
+  Appendix C.2 describes the H100/A100 + vLLM/Ray/FSDP setup, and Appendix H
+  compares LoRA resource usage.
 
 ### Relevant Directions to Compare Against
 
@@ -107,8 +124,12 @@
 - Hindsight / goal relabeling: useful when failed trajectories still contain
   achieved object-goal configurations; HER is the canonical starting point:
   https://papers.nips.cc/paper/7090-hindsight-experience-replay.
+- LLM-agent RL pipeline optimization: RAGEN provides a newer direction where
+  PushWorld is exposed as a text-interaction environment for an LLM policy. This
+  should be evaluated as a systems optimization target with explicit
+  time-to-quality metrics, not as a hand-written solver replacement.
 
-## GPU Environment Motivation
+## Systems Motivation
 
 - Tim Wheeler's Sokoban posts are a useful systems reference for fast batched
   simulation: https://timallanwheeler.com/blog/category/sokoban/.
@@ -119,9 +140,12 @@
   - vectorized multi-process environment steps/sec;
   - observation rendering cost;
   - policy update cost on CPU vs GPU.
-- A GPU environment should probably start with compact integer state tensors
-  rather than RGB observations. RGB can be produced only for debugging/evaluation,
-  while the policy can consume structured planes.
+- The current profiling result weakens the case for making a GPU environment the
+  immediate next step for PPO/DQN: after plane observations and vectorized
+  rollout, learner/update cost dominates short training runs. GPU-resident state
+  propagation becomes more relevant later for batched beam search,
+  transformer-policy inference, or LLM rollout systems where environment/model
+  synchronization becomes the bottleneck.
 
 ## Gymnasium Compatibility
 
@@ -167,3 +191,18 @@ See [hybrid_solver_notes.md](hybrid_solver_notes.md) for a complementary note on
 hybrid planning+learning approaches in the style of FOLLOWER. The short version
 is that this looks promising for PushWorld as a medium-to-long-term direction,
 especially after we have goal-conditioned observations and relabeling.
+
+## RAGEN Follow-Up
+
+RAGEN should be tracked as a separate LLM-agent pipeline:
+
+1. adapt PushWorld as a Gym-compatible text environment;
+2. run a no-finetune fixed-prompt baseline and log full trajectories;
+3. profile wall time, tokens/sec, tokens/episode, generation/update/env-step
+   split, and GPU memory;
+4. test prompt compression, reasoning-token caps, action-only answers, rollout
+   batching, vLLM/Ray settings, LoRA, and rollout filtering.
+
+This direction is newer and heavier than the compact-policy pipelines, so it
+belongs after the base RL, transformer-policy, and hybrid-solver directions in
+the presentation narrative.
