@@ -42,19 +42,39 @@
 
 `То есть compile полезен, но он не решает доминирующий bottleneck сам по себе.`
 
-## Слайд 8: Что дальше
+## Слайд 8: Пайплайн, который мы ускоряем
 
-`Ближайший шаг --- goal-conditioned observations и relabeling: это прямой способ решить проблему sparse-reward, сохраняя быстрый plane pipeline.`
+`Фиксируем базовый pipeline: state -> observation -> policy model -> rollout/replay -> learner update. Вход уже ускорен через planes; дальше для него идут goal-conditioned planes + relabeling, update profiling, AMP, rollout length, minibatch size, update epochs и replay/buffer layout.`
 
-`Потом --- learner-side оптимизация: AMP, настройка update-параметров и более детальный profiling, потому что PPO и DQN уже update-bound.`
+## Слайд 9: Transformer policy
 
-`Дальше идут planning-aligned идеи: transformer policy на траекториях планировщика и hybrid solver, где planner задаёт порядок подзадач или subgoals, а политика локально исполняет их.`
+`Transformer pipeline: planner solutions -> state-action dataset -> plane encoder + transformer -> action/distance heads -> greedy or beam search. Оптимизации: cached dataset, AMP/compile, larger batches, batched beam scoring, state/logit cache.`
 
-## Слайд 9: Источники
+## Слайд 10: Transformer optimization
 
-`Тут три опоры для следующих шагов: HER для relabeling, Tim Wheeler для Sokoban/transformer policy, и Learn to Follow для hybrid planner + learning.`
+`План: экспортировать planner traces, кэшировать plane tensors, сравнить CNN-only baseline с transformer over last k states и distance head, затем оптимизировать dataloader, AMP/compile, batch size, beam width и batched candidate scoring.`
 
-## Слайд 10: Код и материалы
+## Слайд 11: Hybrid solver
+
+`Hybrid pipeline: current state -> planner subgoals -> goal-conditioned executor -> progress monitor -> accept or replan. Цель --- заменить full search на planner skeleton + fast learned local execution.`
+
+## Слайд 12: Hybrid optimization
+
+`Оптимизации: offline subgoal traces, executor imitation/relabeling, profile planner/executor/env/replan time, cache subgoal plans, replan only on failure, learned ranker/value for planner candidates.`
+
+## Слайд 13: RAGEN pipeline
+
+`RAGEN branch: PushWorld Gym wrapper, deterministic text renderer, strict action parser, reward/success adapter. Baseline 1: fixed prompts, no fine-tune, 256 eval episodes. Baseline 2: LoRA/StarPO на маленьком Level 0 split.`
+
+## Слайд 14: RAGEN optimization
+
+`Оптимизации: measure wall time, tokens/sec, tokens/episode, generation/update/env-step split, GPU memory; then compact prompt, reasoning-token cap, action-only answer, vLLM rollout batching, Ray/env placement, LoRA vs full update, high-signal rollout filtering.`
+
+## Слайд 15: Источники
+
+`Тут опоры для следующих шагов: HER для relabeling, Tim Wheeler для Sokoban/transformer policy, Learn to Follow для hybrid planner + learning и RAGEN для LLM-agent RL.`
+
+## Слайд 16: Код и материалы
 
 `Здесь QR-код на репозиторий и прямая ссылка на GitHub, чтобы после доклада можно было быстро открыть проект.`
 

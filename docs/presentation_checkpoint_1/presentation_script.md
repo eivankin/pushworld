@@ -54,25 +54,57 @@
 
 `Это значит, что compile --- реальная оптимизация, но она не бьёт по доминирующему bottleneck сама по себе. И это хорошо согласуется с профилировкой: проблема шире, чем просто скорость forward pass.`
 
-## Слайд 8: Что дальше
+## Слайд 8: Пайплайн, который мы ускоряем
 
-`Из этого становится понятнее, что делать дальше. Ближайший шаг --- goal-conditioned observations и relabeling, потому что это самый прямой способ решить проблему sparse-reward и при этом сохранить уже быстрый plane pipeline.`
+`Теперь явно фиксируем базовый pipeline: PushWorld state, plane observation, policy model, rollout или replay, learner update.`
 
-`Второй ближайший шаг --- learner-side оптимизация: mixed precision, настройка update-параметров и более детальная профилировка update stack, потому что и PPO, и DQN уже update-bound.`
+`Вход уже ускорен: RGB rendering заменён на compact planes, observation payload стал примерно в 50 раз меньше, PPO ускорился примерно втрое, DQN --- примерно в двадцать раз.`
 
-`Дальше есть более planning-aligned направления. Первое --- transformer policy на траекториях планировщика, вдохновлённая работами по Sokoban.`
+`Дальше для этого же pipeline есть понятные шаги: goal-conditioned planes и relabeling, update profiling, AMP, настройка rollout length, minibatch size, update epochs и replay/buffer layout. Основная метрика --- success/time и update seconds per 100k env steps.`
 
-`Второе --- hybrid solver, где planner задаёт порядок подзадач, subgoals или грубый план, а обучаемая политика отвечает за устойчивое локальное исполнение между этими опорными точками.`
+## Слайд 9: Transformer policy pipeline
 
-`И это важный тезис для всего чекпоинта: даже если PPO в текущем виде не станет финальным решателем, compact observations, profiling и ускоренная инфраструктура всё равно переиспользуются дальше --- и для relabeling, и для hybrid solver, и для sequence models.`
+`Первый advanced pipeline --- transformer policy. Planner даёт solution traces, мы превращаем их в state-action dataset, обучаем plane encoder плюс transformer, а на выходе получаем action head и distance или solvability head.`
 
-## Слайд 9: Источники и ориентиры
+`На inference проверяются greedy rollout и beam search. Здесь оптимизируется supervised training и autoregressive search вокруг policy, а не environment stepping. Основа --- работы Wheeler по Sokoban transformer policy и GPU rollout.`
 
-`Здесь собраны три основные внешние опоры для следующих шагов: HER для relabeling, Tim Wheeler для transformer-policy направления и Learn to Follow для hybrid planner + learning подхода.`
+## Слайд 10: Transformer policy: план оптимизации
+
+`Сначала экспортируем planner traces и кэшируем plane tensors, чтобы training не ждал парсер или симулятор. Потом делаем model ablation: CNN-only no-history baseline, transformer по последним k states, затем distance head.`
+
+`После этого оптимизируем training: dataloader, AMP, torch.compile, larger batches. На search side: greedy, beam width 8/16/32, batched scoring всех beam candidates одним forward, state/logit cache.`
+
+## Слайд 11: Hybrid solver pipeline
+
+`Второй advanced pipeline --- hybrid solver. Planner задаёт subgoals, learned executor локально исполняет primitive actions, monitor проверяет прогресс, и replanning запускается только при timeout или регрессе относительно subgoal.`
+
+`Цель --- заменить дорогой full search на planner skeleton плюс fast learned local execution. Метрики: subgoal success, replans per puzzle, planner time versus executor time, solved puzzles per minute.`
+
+## Слайд 12: Hybrid solver: план оптимизации
+
+`Сначала берём solution traces и нарезаем их на достижимые partial goals через каждые k действий. Executor baseline учится на этих subgoals через imitation или relabeling.`
+
+`Затем отдельно профилируем planner call time, executor inference, env stepping и replanning overhead. Оптимизации: cache subgoal plans, replan only on failure, learned ranker/value вместо полного rollout search по нескольким candidates. Ablation: planner-only, executor-only, hybrid without ranker, hybrid with ranker.`
+
+## Слайд 13: RAGEN pipeline: LLM-agent RL
+
+`Третий advanced pipeline --- RAGEN, более новая LLM-agent RL ветка. RAGEN обучает LLM agents через multi-turn environment interaction: state text, reasoning/action, reward, затем policy update.`
+
+`PushWorld adaptation здесь конкретная: Gym wrapper, deterministic text renderer, strict action parser, reward/success adapter. Baselines: fixed prompt without fine-tune на 256 episodes; затем LoRA/StarPO на маленьком Level 0 split.`
+
+## Слайд 14: RAGEN pipeline: план оптимизации
+
+`RAGEN оптимизируем как тяжёлый LLM/RL pipeline. Сначала baseline profiling: wall time, tokens/sec, tokens per episode, env-step time, generation time, update time, GPU memory.`
+
+`Затем interventions: prompt compression, reasoning-token cap, one-token action answer, rollout batching через vLLM, Ray worker/env placement, no-finetune versus LoRA versus full update, high-signal rollout filtering. RAGEN paper даёт runtime context, но не полноценную throughput table.`
+
+## Слайд 15: Источники и ориентиры
+
+`Здесь собраны внешние опоры для следующих шагов: HER для relabeling, Tim Wheeler для transformer-policy направления, Learn to Follow для hybrid planner + learning подхода и RAGEN как ориентир по LLM-agent RL.`
 
 `На этом можно закончить основную часть и перейти к вопросам.`
 
-## Слайд 10: Код и материалы
+## Слайд 16: Код и материалы
 
 `Здесь можно быстро показать QR-код на репозиторий и оставить прямую ссылку на GitHub, чтобы материал было проще открыть после доклада.`
 
@@ -89,3 +121,7 @@
 Если спросят, почему мы вообще смотрим на planning-style идеи:
 
 `Потому что PushWorld по сути является planning benchmark, и текущие PPO/DQN служат нам скорее измерительным baseline, чем финальной архитектурой.`
+
+Если спросят, нужно ли прямо сейчас адаптировать RAGEN:
+
+`Да. План не в том, чтобы рассуждать, полезен ли RAGEN вообще, а в том, чтобы сделать adapter, получить prompt-only baseline, измерить bottleneck split и затем оптимизировать конкретные места: prompt length, reasoning budget, rollout batching, vLLM/Ray settings, LoRA и filtering.`
