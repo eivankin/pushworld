@@ -6,6 +6,7 @@ import random
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +26,28 @@ from pushworld.puzzle import Actions, PushWorldPuzzle  # noqa: E402
 
 ACTION_CHARS = "LRUD"
 ACTION_NAMES = ("left", "right", "up", "down")
+SYMMETRY_TRANSFORMS = (
+    "r0",
+    "r90",
+    "r180",
+    "r270",
+    "r0_flipped",
+    "r90_flipped",
+    "r180_flipped",
+    "r270_flipped",
+)
+ACTION_CHAR_TO_INDEX = {char: idx for idx, char in enumerate(ACTION_CHARS)}
+ACTION_INDEX_TO_CHAR = {idx: char for idx, char in enumerate(ACTION_CHARS)}
+TRANSFORM_ACTION_MAP = {
+    "r0": {"L": "L", "R": "R", "U": "U", "D": "D"},
+    "r90": {"L": "U", "R": "D", "U": "R", "D": "L"},
+    "r180": {"L": "R", "R": "L", "U": "D", "D": "U"},
+    "r270": {"L": "D", "R": "U", "U": "L", "D": "R"},
+    "r0_flipped": {"L": "L", "R": "R", "U": "D", "D": "U"},
+    "r90_flipped": {"L": "U", "R": "D", "U": "L", "D": "R"},
+    "r180_flipped": {"L": "R", "R": "L", "U": "U", "D": "D"},
+    "r270_flipped": {"L": "D", "R": "U", "U": "R", "D": "L"},
+}
 
 
 def set_seed(seed: int) -> None:
@@ -42,39 +65,96 @@ class Trajectory:
     solve_time_s: float
 
 
+@dataclass(frozen=True)
+class ExpertStep:
+    puzzle: PushWorldPuzzle
+    puzzle_height: int
+    puzzle_width: int
+    state: tuple[tuple[int, int], ...]
+    action: int
+    remaining: int
+    transforms: tuple[str, ...]
+
+
 class ExpertDataset(Dataset):
     def __init__(
         self,
         trajectories: list[Trajectory],
         height: int,
         width: int,
+        transforms: tuple[str, ...] = ("r0",),
+        transform_level0_only: bool = False,
+        seed: int = 1,
     ) -> None:
-        self.examples: list[tuple[np.ndarray, int, int]] = []
+        self.steps: list[ExpertStep] = []
         self.height = height
         self.width = width
+        self.transforms = transforms
+        self.transform_level0_only = transform_level0_only
+        self.base_examples = 0
+        self.augmented_base_examples = 0
+        self.unaugmented_base_examples = 0
+        self.rng = random.Random(seed)
 
         for trajectory in trajectories:
             puzzle = PushWorldPuzzle(str(trajectory.puzzle_path))
+            puzzle_width, puzzle_height = puzzle.dimensions
             state = puzzle.initial_state
             plan_length = len(trajectory.plan)
+            trajectory_transforms = transforms
+            if transform_level0_only and not is_level0_path(trajectory.puzzle_path):
+                trajectory_transforms = ("r0",)
             for step_idx, action_char in enumerate(trajectory.plan):
                 action = Actions.FROM_CHAR[action_char]
                 remaining = plan_length - step_idx
-                self.examples.append((encode_state(puzzle, state, height, width), action, remaining))
+                self.base_examples += 1
+                if len(trajectory_transforms) > 1:
+                    self.augmented_base_examples += 1
+                else:
+                    self.unaugmented_base_examples += 1
+                self.steps.append(
+                    ExpertStep(
+                        puzzle=puzzle,
+                        puzzle_height=puzzle_height,
+                        puzzle_width=puzzle_width,
+                        state=state,
+                        action=action,
+                        remaining=remaining,
+                        transforms=trajectory_transforms,
+                    )
+                )
                 state = puzzle.get_next_state(state, action)
             if not puzzle.is_goal_state(state):
                 raise ValueError(f"Planner trace does not solve {trajectory.puzzle_path}")
 
     def __len__(self) -> int:
-        return len(self.examples)
+        return len(self.steps)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        state, action, remaining = self.examples[idx]
+        step = self.steps[idx]
+        transform = self.rng.choice(step.transforms) if len(step.transforms) > 1 else "r0"
+        state = transform_encoded_state(
+            encode_state(step.puzzle, step.state, self.height, self.width),
+            puzzle_height=step.puzzle_height,
+            puzzle_width=step.puzzle_width,
+            height=self.height,
+            width=self.width,
+            transform=transform,
+        )
+        action = transform_action(step.action, transform)
         return (
             torch.from_numpy(state),
             torch.tensor(action, dtype=torch.long),
-            torch.tensor(remaining, dtype=torch.long),
+            torch.tensor(step.remaining, dtype=torch.long),
         )
+
+
+def is_level0_path(path: Path) -> bool:
+    try:
+        path.resolve().relative_to((PROJECT_ROOT / "data/level0").resolve())
+        return True
+    except ValueError:
+        return False
 
 
 class BoardTransformerPolicy(nn.Module):
@@ -165,6 +245,40 @@ def set_cells(
             planes[channel, y, x] = 1.0
 
 
+def transform_action(action: int, transform: str) -> int:
+    action_char = ACTION_INDEX_TO_CHAR[action]
+    transformed_char = TRANSFORM_ACTION_MAP[transform][action_char]
+    return ACTION_CHAR_TO_INDEX[transformed_char]
+
+
+def transform_encoded_state(
+    planes: np.ndarray,
+    puzzle_height: int,
+    puzzle_width: int,
+    height: int,
+    width: int,
+    transform: str,
+) -> np.ndarray:
+    crop = planes[:, :puzzle_height, :puzzle_width]
+    transformed = crop
+    if transform.endswith("_flipped"):
+        transformed = np.flip(transformed, axis=1)
+    rotation = int(transform.split("_", maxsplit=1)[0][1:])
+    for _ in range(rotation // 90):
+        transformed = np.rot90(transformed, axes=(2, 1))
+
+    transformed = transformed.copy()
+    transformed_height, transformed_width = transformed.shape[1:]
+    if transformed_height > height or transformed_width > width:
+        raise ValueError(
+            f"Transformed state {transform} has shape "
+            f"{transformed_height}x{transformed_width}, exceeding {height}x{width}"
+        )
+    output = np.zeros_like(planes)
+    output[:, :transformed_height, :transformed_width] = transformed
+    return output
+
+
 def encode_state(
     puzzle: PushWorldPuzzle,
     state: tuple[tuple[int, int], ...],
@@ -220,6 +334,31 @@ def solve_with_rgd(planner: Path, puzzle_path: Path, time_limit: float) -> Traje
     if not puzzle.is_valid_plan(actions):
         raise RuntimeError(f"Planner returned invalid plan for {puzzle_path}: {plan}")
     return Trajectory(puzzle_path=puzzle_path, plan=plan, solve_time_s=elapsed)
+
+
+def solve_trajectories(
+    planner: Path,
+    puzzle_paths: list[Path],
+    time_limit: float,
+    workers: int,
+) -> list[Trajectory]:
+    if workers <= 1:
+        return [
+            solve_with_rgd(planner, path, time_limit)
+            for path in tqdm(puzzle_paths, desc="solve expert traces", unit="puzzle")
+        ]
+
+    trajectories: list[Trajectory | None] = [None] * len(puzzle_paths)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(solve_with_rgd, planner, path, time_limit): idx
+            for idx, path in enumerate(puzzle_paths)
+        }
+        progress = tqdm(as_completed(futures), total=len(futures), desc="solve expert traces", unit="puzzle")
+        for future in progress:
+            idx = futures[future]
+            trajectories[idx] = future.result()
+    return [trajectory for trajectory in trajectories if trajectory is not None]
 
 
 def train(
@@ -566,6 +705,19 @@ def main() -> None:
     parser.add_argument("--all-train", action="store_true", help="Use all train puzzles.")
     parser.add_argument("--all-test", action="store_true", help="Evaluate all held-out Level 0 puzzles.")
     parser.add_argument("--all-level1", action="store_true", help="Evaluate all Level 1 puzzles.")
+    parser.add_argument(
+        "--level0-symmetry-augment",
+        action="store_true",
+        help="Augment train examples in memory with Level-0 rotation/flip symmetries.",
+    )
+    parser.add_argument(
+        "--augment-transforms",
+        default="all",
+        help=(
+            "Comma-separated transform names, or 'all'. Available: "
+            + ",".join(SYMMETRY_TRANSFORMS)
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -589,36 +741,58 @@ def main() -> None:
     parser.add_argument("--print-expert-plans", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--planner-time-limit", type=float, default=10.0)
+    parser.add_argument("--planner-workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
 
     set_seed(args.seed)
+    if args.planner_workers < 1:
+        raise ValueError("--planner-workers must be >= 1")
+
+    if args.augment_transforms == "all":
+        train_transforms = SYMMETRY_TRANSFORMS if args.level0_symmetry_augment else ("r0",)
+    else:
+        train_transforms = tuple(name.strip() for name in args.augment_transforms.split(",") if name.strip())
+        unknown_transforms = sorted(set(train_transforms) - set(SYMMETRY_TRANSFORMS))
+        if unknown_transforms:
+            raise ValueError(f"Unknown --augment-transforms values: {unknown_transforms}")
+        if not args.level0_symmetry_augment:
+            train_transforms = ("r0",)
 
     train_dirs = args.train_dir or [PROJECT_ROOT / "data/level0/base/train"]
     test_dirs = args.test_dir or [PROJECT_ROOT / "data/level0/base/test"]
     level1_dirs = [args.level1_dir]
+
+    if len(train_dirs) > 1 and not args.all_train and args.train_puzzles == 5:
+        raise ValueError(
+            "Multiple --train-dir values were provided, but --all-train was not set "
+            "and --train-puzzles is still the default 5. Pass --all-train for the "
+            "full run, or set --train-puzzles explicitly for a small mixed smoke."
+        )
 
     train_paths = select_puzzles(train_dirs, args.train_puzzles, args.all_train)
     test_paths = select_puzzles(test_dirs, args.test_puzzles, args.all_test)
     level1_paths = select_puzzles(level1_dirs, args.level1_puzzles, args.all_level1)
     all_paths = train_paths + test_paths + level1_paths
     height, width = max_dimensions(all_paths)
+    if args.level0_symmetry_augment:
+        max_side = max(height, width)
+        height = max_side
+        width = max_side
 
     print(f"device cuda={torch.cuda.is_available()}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"train_puzzles={len(train_paths)} test_puzzles={len(test_paths)} level1={len(level1_paths)}")
     print("train_dirs=" + json.dumps([str(path) for path in train_dirs], indent=2))
     print("test_dirs=" + json.dumps([str(path) for path in test_dirs], indent=2))
-    print(f"board={height}x{width} planner={args.planner}")
+    print(f"level0_symmetry_augment={args.level0_symmetry_augment} transforms={list(train_transforms)}")
+    print(f"board={height}x{width} planner={args.planner} planner_workers={args.planner_workers}")
     writer = make_tensorboard_writer(args.tensorboard_log)
     if writer is not None:
         writer.add_text("config/args", json.dumps({k: str(v) for k, v in vars(args).items()}, indent=2))
 
     solve_start = time.perf_counter()
-    trajectories = [
-        solve_with_rgd(args.planner, path, args.planner_time_limit)
-        for path in tqdm(train_paths, desc="solve expert traces", unit="puzzle")
-    ]
+    trajectories = solve_trajectories(args.planner, train_paths, args.planner_time_limit, args.planner_workers)
     solve_time = time.perf_counter() - solve_start
     expert_plan_summary = [
         {"puzzle": t.puzzle_path.name, "plan": t.plan, "solve_time_s": round(t.solve_time_s, 4)}
@@ -642,10 +816,35 @@ def main() -> None:
             )
         )
 
-    dataset = ExpertDataset(trajectories, height=height, width=width)
+    dataset = ExpertDataset(
+        trajectories,
+        height=height,
+        width=width,
+        transforms=train_transforms,
+        transform_level0_only=args.level0_symmetry_augment,
+        seed=args.seed,
+    )
+    print(
+        "dataset_summary="
+        + json.dumps(
+            {
+                "base_examples": dataset.base_examples,
+                "augmented_examples": len(dataset),
+                "augmentation_factor": round(len(dataset) / max(1, dataset.base_examples), 2),
+                "level0_augmented_base_examples": dataset.augmented_base_examples,
+                "unaugmented_base_examples": dataset.unaugmented_base_examples,
+                "transforms": list(train_transforms),
+            },
+            indent=2,
+        )
+    )
     if writer is not None:
         writer.add_scalar("data/train_puzzles", len(train_paths), 0)
+        writer.add_scalar("data/base_examples", dataset.base_examples, 0)
+        writer.add_scalar("data/level0_augmented_base_examples", dataset.augmented_base_examples, 0)
+        writer.add_scalar("data/unaugmented_base_examples", dataset.unaugmented_base_examples, 0)
         writer.add_scalar("data/examples", len(dataset), 0)
+        writer.add_scalar("data/augmentation_factor", len(dataset) / max(1, dataset.base_examples), 0)
         writer.add_scalar("time/expert_solve_s", solve_time, 0)
     model = BoardTransformerPolicy(
         channels=7,
@@ -743,6 +942,11 @@ def main() -> None:
 
     summary = {
         "examples": len(dataset),
+        "base_examples": dataset.base_examples,
+        "augmentation_factor": round(len(dataset) / max(1, dataset.base_examples), 2),
+        "level0_augmented_base_examples": dataset.augmented_base_examples,
+        "unaugmented_base_examples": dataset.unaugmented_base_examples,
+        "transforms": list(train_transforms),
         "solve_time_s": round(solve_time, 3),
         "train_time_s": round(train_time, 3),
         "final_loss": round(losses[-1], 6) if losses else None,
@@ -754,6 +958,7 @@ def main() -> None:
         "layers": args.layers,
         "amp": args.amp,
         "seed": args.seed,
+        "planner_workers": args.planner_workers,
         "max_cache_entries": args.max_cache_entries,
         "train_eval": compact_eval(train_eval),
         "level0_test_eval": compact_eval(test_eval),

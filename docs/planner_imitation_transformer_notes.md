@@ -9,6 +9,10 @@ planner trajectories and compare its closed-loop success against PPO/DQN.
 Script:
 
 - `scripts/train_planner_imitation_smoke.py`
+- `scripts/train_planner_imitation_v2.py` for in-memory Level 0 symmetry
+  augmentation.
+- `scripts/build_level1_augmented_dataset.py` for cached, split-safe Level 1
+  augmentation.
 
 Pipeline:
 
@@ -112,6 +116,11 @@ Already implemented:
 - model checkpoint output via `--model-output`.
 - eval-only checkpoint loading via `scripts/eval_planner_imitation.py`, so
   rollout limits and beam settings can be compared without retraining.
+- v2 in-memory Level 0 symmetry augmentation, using the 8 rotation/flip
+  transforms without writing augmented `.pwp` files.
+- cached Level 1 augmentation builder that splits source symmetry groups before
+  generating variants, preventing train/test leakage through rotated or mirrored
+  copies.
 
 The current beam evaluator is still Python-heavy. The cache/pruning changes
 should reduce repeated encoding and wasted beam branches, but the exact speedup
@@ -148,6 +157,7 @@ Model-side:
 - try a CNN-only baseline vs transformer encoder;
 - add goal/object identity channels if Level 1 transfer remains weak;
 - train on all Level 0 variants, not only `base`;
+- train with Level 0 symmetry augmentation to reduce orientation overfitting;
 - optionally include modern heuristic-solver Level 1 traces as a second-stage
   curriculum.
 
@@ -179,6 +189,7 @@ uv run python -u scripts/train_planner_imitation_smoke.py \
   --beam-width 8 \
   --beam-depth 8 \
   --top-k 3 \
+  --seed 1 \
   --eval-every 10 \
   --eval-puzzles 50 \
   --log-every-batches 10 \
@@ -230,6 +241,7 @@ uv run python -u scripts/train_planner_imitation_smoke.py \
   --beam-width 8 \
   --beam-depth 8 \
   --top-k 3 \
+  --seed 1 \
   --eval-every 1 \
   --eval-puzzles 100 \
   --log-every-batches 10 \
@@ -241,6 +253,251 @@ uv run python -u scripts/train_planner_imitation_smoke.py \
 
 This uses `8000` train puzzles and `800` held-out Level 0 puzzles. At the
 observed full-base speed, expect roughly `4x` the per-epoch time of base-only.
+
+## Level 0 Symmetry-Augmented V2
+
+`scripts/train_planner_imitation_v2.py` keeps the RGD trace count unchanged and
+expands examples in memory. For each expert state/action pair, it adds the 8
+dihedral grid transforms and remaps the action label consistently.
+
+Smoke command:
+
+```bash
+uv run python -u scripts/train_planner_imitation_v2.py \
+  --train-puzzles 3 \
+  --test-puzzles 2 \
+  --level1-puzzles 1 \
+  --epochs 1 \
+  --batch-size 16 \
+  --lr 0.001 \
+  --d-model 32 \
+  --nhead 4 \
+  --layers 1 \
+  --max-steps 30 \
+  --beam-width 1 \
+  --beam-depth 1 \
+  --top-k 1 \
+  --seed 1 \
+  --eval-every 0 \
+  --level0-symmetry-augment \
+  --skip-train-eval
+```
+
+Smoke result:
+
+- expert traces: `3` puzzles, `18` base states;
+- augmented examples: `144`;
+- augmentation factor: `8.0x`;
+- train/eval path completed without writing generated puzzle files.
+
+Full comparable experiment should use the same settings as the current
+multi-variant run, changing only the script name and adding
+`--level0-symmetry-augment`.
+
+Training scripts now expose `--seed`; keep it in every reported command.
+`scripts/build_level1_augmented_dataset.py` also exposes `--seed` for source
+split assignment and advanced proposal sampling. The eval-only script is
+deterministic for a fixed checkpoint and puzzle list, so it does not need a seed
+for ordinary reporting.
+
+## All-Level-0 Quick Run With Level 1 Cache
+
+Training on all `14k` Level 0 train maps with fully materialized `8x` symmetry
+augmentation is not a quick run. The v2 trainer instead uses lazy on-the-fly
+Level 0 augmentation: each dataset item corresponds to one expert state, and a
+random symmetry transform is chosen when the item is loaded.
+
+Important implementation detail:
+
+- `--level0-symmetry-augment` only augments paths under `data/level0`;
+- cached Level 1 train paths are left as-is;
+- dataset size stays close to the number of expert states instead of multiplying
+  by `8x`;
+- Level 0 transforms are re-sampled on access, so later epochs can see different
+  orientations.
+
+Train command:
+
+```bash
+uv run python -u scripts/train_planner_imitation_v2.py \
+  --train-dir data/level0/base/train \
+  --train-dir data/level0/all/train \
+  --train-dir data/level0/goals/train \
+  --train-dir data/level0/obstacles/train \
+  --train-dir data/level0/shapes/train \
+  --train-dir data/level0/size/train \
+  --train-dir data/level0/walls/train \
+  --train-dir data/augmented/level1_verified_advanced_seed1_train50_p8/train \
+  --all-train \
+  --test-puzzles 0 \
+  --level1-puzzles 0 \
+  --epochs 1 \
+  --batch-size 64 \
+  --lr 0.001 \
+  --d-model 64 \
+  --nhead 4 \
+  --layers 1 \
+  --amp \
+  --max-steps 200 \
+  --beam-width 8 \
+  --beam-depth 8 \
+  --top-k 3 \
+  --eval-every 0 \
+  --log-every-batches 10 \
+  --skip-train-eval \
+  --level0-symmetry-augment \
+  --planner-workers 6 \
+  --seed 1 \
+  --tensorboard-log runs/planner_imitation_all_level0_l1cache_lazyaug_seed1 \
+  --output reports/planner_imitation_all_level0_l1cache_lazyaug_seed1.json \
+  --model-output models/planner_imitation_all_level0_l1cache_lazyaug_seed1.pt
+```
+
+Split-aware original Level 1 eval:
+
+```bash
+uv run python -u scripts/eval_level1_original_by_aug_split.py \
+  --checkpoint models/planner_imitation_all_level0_l1cache_lazyaug_seed1.pt \
+  --manifest data/augmented/level1_verified_advanced_seed1_train50_p8/manifest.json \
+  --max-steps 200 \
+  --beam-width 8 \
+  --beam-depth 8 \
+  --top-k 3 \
+  --output reports/eval_level1_original_by_aug_split_all_level0_l1cache_lazyaug_seed1.json
+```
+
+This reports original Level 1 success separately for source groups that were in
+the Level 1 augmented train split and source groups that were held out.
+
+## Level 1 Cached Augmentation
+
+`scripts/build_level1_augmented_dataset.py` builds a cached Level 1 dataset.
+Unlike Level 0 augmentation, this writes `.pwp` files because Level 1 has only
+`68` originals and advanced perturbations need RGD verification.
+
+Leakage rule:
+
+- group source originals by canonical symmetry orbit;
+- split these source groups into train/val/test;
+- generate all variants only after the split;
+- every generated variant inherits the split of its source group.
+
+This prevents a rotated, mirrored, or transposed copy of a held-out Level 1
+source puzzle from appearing in train.
+
+Generation order:
+
+- start from the original source layout or an advanced perturbed layout;
+- generate the 8 rotation/flip variants from that base layout;
+- parse and RGD-verify the base layout once;
+- keep the base layout only if it solves under the plan-length limit;
+- emit the 8 rotation/flip variants without extra RGD checks.
+
+Implemented advanced proposal methods:
+
+- `wall_toggle`: add/remove one wall on an empty/wall cell;
+- `remove_movable`: remove one non-goal movable obstacle;
+- `add_movable`: add a new one- or two-cell non-goal movable obstacle;
+- `add_goal`: add a secondary goal for an existing non-goal movable obstacle;
+- `move_goal_shift`: move an existing goal shape within a small radius;
+- `move_goal_random`: move an existing goal shape to a random valid empty
+  placement.
+
+Smoke command:
+
+```bash
+uv run python -u scripts/build_level1_augmented_dataset.py \
+  --limit-originals 2 \
+  --train-ratio 0.5 \
+  --seed 11 \
+  --advanced-per-original 2 \
+  --advanced-max-attempts-per-original 20 \
+  --advanced-methods wall_toggle,remove_movable,add_movable,add_goal,move_goal_shift,move_goal_random \
+  --max-new-movable-cells 2 \
+  --goal-shift-radius 2 \
+  --planner-time-limit 5 \
+  --max-plan-len 200 \
+  --output-dir /tmp/pushworld_level1_aug_advanced_smoke_20260501 \
+  --overwrite
+```
+
+Smoke result:
+
+- source puzzles: `2`;
+- source groups: `2`;
+- generated variants: `48`;
+- original symmetry variants: `16`;
+- accepted advanced variants: `32`;
+- accepted advanced kinds: `remove_movable`, `move_goal_shift`,
+  `add_movable`, `move_goal_random`;
+- rejected base layouts: `4`;
+- split counts: `24 train`, `24 test`;
+- manifest audit: no source group appears in more than one split.
+
+Full basic-cache command:
+
+```bash
+uv run python -u scripts/build_level1_augmented_dataset.py \
+  --train-ratio 0.8 \
+  --val-ratio 0.0 \
+  --seed 1 \
+  --planner-time-limit 10 \
+  --max-plan-len 200 \
+  --output-dir data/augmented/level1_verified_symmetry
+```
+
+Full cache with small verified perturbation budget:
+
+```bash
+uv run python -u scripts/build_level1_augmented_dataset.py \
+  --train-ratio 0.8 \
+  --val-ratio 0.0 \
+  --seed 1 \
+  --planner-time-limit 10 \
+  --max-plan-len 200 \
+  --advanced-per-original 4 \
+  --advanced-max-attempts-per-original 40 \
+  --advanced-methods wall_toggle,remove_movable,add_movable,add_goal,move_goal_shift,move_goal_random \
+  --max-new-movable-cells 2 \
+  --goal-shift-radius 2 \
+  --output-dir data/augmented/level1_verified_symmetry_advanced
+```
+
+The advanced proposals are intentionally generators, not trusted labels. The
+final dataset contains only variants whose base layout parses and solves with
+RGD under the configured plan-length limit. Advanced augmentations are currently
+independent by default: each accepted candidate applies one advanced generator
+to the original source layout, then symmetry expansion. Use
+`--advanced-stack-depth 2` or higher to apply multiple advanced generators
+sequentially before the single RGD base-layout check.
+
+Stacked smoke command:
+
+```bash
+uv run python -u scripts/build_level1_augmented_dataset.py \
+  --limit-originals 2 \
+  --train-ratio 0.5 \
+  --seed 13 \
+  --advanced-per-original 2 \
+  --advanced-max-attempts-per-original 30 \
+  --advanced-stack-depth 2 \
+  --advanced-methods wall_toggle,remove_movable,add_movable,add_goal,move_goal_shift,move_goal_random \
+  --max-new-movable-cells 2 \
+  --goal-shift-radius 2 \
+  --planner-time-limit 5 \
+  --max-plan-len 200 \
+  --output-dir /tmp/pushworld_level1_aug_stack_smoke_20260501 \
+  --overwrite
+```
+
+Stacked smoke result:
+
+- generated variants: `48`;
+- rejected base layouts: `8`;
+- accepted stacked kinds included `add_movable+move_goal_random`,
+  `remove_movable+wall_toggle`, `move_goal_random+add_movable`, and
+  `wall_toggle+add_movable`;
+- manifest audit: no source group appears in more than one split.
 
 ## Table-2-Style Evaluation Commands
 
