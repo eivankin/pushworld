@@ -7,11 +7,11 @@ from pathlib import Path
 import torch
 from tqdm.auto import tqdm
 
+from planner_imitation_rollout import choose_action
 from pushworld_study.paths import PROJECT_ROOT, ensure_upstream_pushworld_on_path
-from train_planner_imitation_smoke import (
+from train_planner_imitation_v2 import (
     ACTION_CHARS,
     BoardTransformerPolicy,
-    choose_action,
     select_puzzles,
 )
 
@@ -59,6 +59,7 @@ def evaluate_split(
     top_k: int,
     max_cache_entries: int,
     split_name: str,
+    repeat_penalty: float = 0.0,
 ) -> dict[str, object]:
     solved = 0
     results = []
@@ -104,6 +105,8 @@ def evaluate_split(
                     puzzle_key=str(path),
                     encode_cache=encode_cache,
                     max_cache_entries=max_cache_entries,
+                    seen_states=seen,
+                    repeat_penalty=repeat_penalty,
                 )
                 actions.append(ACTION_CHARS[action])
                 state = puzzle.get_next_state(state, action)
@@ -136,6 +139,7 @@ def evaluate_split(
         "beam_width": beam_width,
         "beam_depth": beam_depth,
         "top_k": top_k,
+        "repeat_penalty": repeat_penalty,
         "results": results,
     }
 
@@ -160,12 +164,16 @@ def main() -> None:
     parser.add_argument("--beam-width", type=int, default=8)
     parser.add_argument("--beam-depth", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument("--repeat-penalty", type=float, default=0.0)
     parser.add_argument("--max-cache-entries", type=int, default=250_000)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--tensorboard-log", type=Path, default=None)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    if args.repeat_penalty < 0.0:
+        raise ValueError("--repeat-penalty must be >= 0")
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -179,7 +187,7 @@ def main() -> None:
     print(f"checkpoint={args.checkpoint}")
     print(f"checkpoint_board=height:{height}, width:{width}")
     print("eval_dirs=" + json.dumps([str(path) for path in args.eval_dir], indent=2))
-    print(f"eval_puzzles={len(puzzle_paths)} max_steps={args.max_steps}")
+    print(f"eval_puzzles={len(puzzle_paths)} max_steps={args.max_steps} repeat_penalty={args.repeat_penalty}")
 
     result = evaluate_split(
         model,
@@ -193,6 +201,7 @@ def main() -> None:
         args.top_k,
         args.max_cache_entries,
         args.split_name,
+        args.repeat_penalty,
     )
 
     summary = dict(result)

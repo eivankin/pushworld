@@ -38,11 +38,15 @@ def main() -> None:
     parser.add_argument("--beam-width", type=int, default=8)
     parser.add_argument("--beam-depth", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument("--repeat-penalty", type=float, default=0.0)
     parser.add_argument("--max-cache-entries", type=int, default=250_000)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    if args.repeat_penalty < 0.0:
+        raise ValueError("--repeat-penalty must be >= 0")
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -66,6 +70,7 @@ def main() -> None:
     print(f"device={device}")
     print(f"checkpoint={args.checkpoint}")
     print(f"manifest={args.manifest}")
+    print(f"repeat_penalty={args.repeat_penalty}")
     print("source_split_counts=" + json.dumps({k: len(v) for k, v in sorted(paths_by_split.items())}, indent=2))
 
     summary: dict[str, object] = {
@@ -87,6 +92,7 @@ def main() -> None:
             args.top_k,
             args.max_cache_entries,
             f"level1_original_{split}",
+            args.repeat_penalty,
         )
         if not args.verbose:
             result["results"] = [

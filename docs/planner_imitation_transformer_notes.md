@@ -111,9 +111,19 @@ Already implemented:
 - cached state encodings during beam evaluation;
 - duplicate beam-state pruning;
 - no-op action pruning inside beam expansion;
+- repeat-aware rollout scoring via `--repeat-penalty`;
 - batched neural scoring of beam states and leaf states;
+- shared rollout implementation in `scripts/planner_imitation_rollout.py`, used by
+  both training-time eval and standalone eval scripts;
 - compact JSON summary output via `--output`;
 - model checkpoint output via `--model-output`.
+- automatic per-epoch checkpoints for `scripts/train_planner_imitation_v2.py`:
+  with `--model-output models/foo.pt`, epoch checkpoints are written to
+  `models/foo_epochs/epoch_001.pt`, `epoch_002.pt`, etc.;
+- graceful interrupt handling in `scripts/train_planner_imitation_v2.py`: a
+  `KeyboardInterrupt` saves `interrupted_epoch_XXX.pt` with model, optimizer,
+  scaler, epoch, and global step, then skips final eval;
+- resume support via `--resume-checkpoint path/to/epoch_XXX.pt`;
 - eval-only checkpoint loading via `scripts/eval_planner_imitation.py`, so
   rollout limits and beam settings can be compared without retraining.
 - v2 in-memory Level 0 symmetry augmentation, using the 8 rotation/flip
@@ -121,6 +131,19 @@ Already implemented:
 - cached Level 1 augmentation builder that splits source symmetry groups before
   generating variants, preventing train/test leakage through rotated or mirrored
   copies.
+
+Repeat penalty details:
+
+- default `--repeat-penalty 0.0` preserves the old behavior;
+- positive values add cost to beam candidates that revisit a state already seen
+  during the current rollout;
+- greedy rollout uses the same signal by preferring the best non-repeating
+  legal action when one exists;
+- the penalty is a rollout/evaluation option, not a training loss change.
+
+Suggested first comparison values are `0.0`, `1.0`, and `2.0`. Beam scores are
+negative log-probability plus a small value-head distance term, so `2.0` is a
+meaningful but non-infinite penalty.
 
 The current beam evaluator is still Python-heavy. The cache/pruning changes
 should reduce repeated encoding and wasted beam branches, but the exact speedup
@@ -353,6 +376,46 @@ uv run python -u scripts/train_planner_imitation_v2.py \
   --model-output models/planner_imitation_all_level0_l1cache_lazyaug_seed1.pt
 ```
 
+Resume from the latest epoch checkpoint by keeping the same training command
+and adding `--resume-checkpoint`. `--epochs` is the final target epoch, not the
+number of extra epochs. For example, to continue after epoch 3 up to epoch 10:
+
+```bash
+uv run python -u scripts/train_planner_imitation_v2.py \
+  --train-dir data/level0/base/train \
+  --train-dir data/level0/all/train \
+  --train-dir data/level0/goals/train \
+  --train-dir data/level0/obstacles/train \
+  --train-dir data/level0/shapes/train \
+  --train-dir data/level0/size/train \
+  --train-dir data/level0/walls/train \
+  --train-dir data/augmented/level1_verified_advanced_seed1_train50_p8/train \
+  --all-train \
+  --test-puzzles 0 \
+  --level1-puzzles 0 \
+  --epochs 10 \
+  --batch-size 64 \
+  --lr 0.001 \
+  --d-model 64 \
+  --nhead 4 \
+  --layers 1 \
+  --amp \
+  --max-steps 200 \
+  --beam-width 8 \
+  --beam-depth 8 \
+  --top-k 3 \
+  --eval-every 0 \
+  --log-every-batches 10 \
+  --skip-train-eval \
+  --level0-symmetry-augment \
+  --planner-workers 6 \
+  --seed 1 \
+  --resume-checkpoint models/planner_imitation_all_level0_l1cache_lazyaug_seed1_epochs/epoch_003.pt \
+  --tensorboard-log runs/planner_imitation_all_level0_l1cache_lazyaug_seed1 \
+  --output reports/planner_imitation_all_level0_l1cache_lazyaug_seed1.json \
+  --model-output models/planner_imitation_all_level0_l1cache_lazyaug_seed1.pt
+```
+
 Split-aware original Level 1 eval:
 
 ```bash
@@ -368,6 +431,29 @@ uv run python -u scripts/eval_level1_original_by_aug_split.py \
 
 This reports original Level 1 success separately for source groups that were in
 the Level 1 augmented train split and source groups that were held out.
+
+Repeat-penalty comparison for the same checkpoint:
+
+```bash
+for penalty in 0 1 2; do
+  uv run python -u scripts/eval_level1_original_by_aug_split.py \
+    --checkpoint models/planner_imitation_all_level0_l1cache_lazyaug_seed1.pt \
+    --manifest data/augmented/level1_verified_advanced_seed1_train50_p8/manifest.json \
+    --max-steps 200 \
+    --beam-width 8 \
+    --beam-depth 8 \
+    --top-k 3 \
+    --repeat-penalty "$penalty" \
+    --output "reports/eval_level1_original_by_aug_split_all_level0_l1cache_lazyaug_seed1_repeat${penalty}.json"
+done
+```
+
+Use the same `--repeat-penalty` flag with `scripts/eval_planner_imitation.py`
+for Level 0 table-style runs.
+
+The Streamlit demo uses the same shared rollout code and exposes the same
+repeat penalty control, so demo behavior should match eval-script behavior for
+the same checkpoint and rollout settings.
 
 ## Level 1 Cached Augmentation
 

@@ -17,11 +17,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from train_planner_imitation_smoke import (
+from eval_planner_imitation import load_checkpoint
+from planner_imitation_rollout import choose_action
+from train_planner_imitation_v2 import (
     ACTION_CHARS,
-    BoardTransformerPolicy,
-    choose_action,
-    select_puzzles,
 )
 
 
@@ -86,30 +85,9 @@ def set_editor_text_value(text: str) -> None:
 
 @st.cache_resource(show_spinner="Loading policy checkpoint...")
 def load_policy(checkpoint_path: str, device_name: str):
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state_dict = checkpoint["model_state_dict"]
-    args = checkpoint.get("args", {})
-    height = int(checkpoint["height"])
-    width = int(checkpoint["width"])
-    d_model = int(args.get("d_model", state_dict["token_proj.weight"].shape[0]))
-    nhead = int(args.get("nhead", 4))
-    layers = int(args.get("layers", 1))
-    distance_bins = int(state_dict["distance_head.weight"].shape[0])
-
     device = torch.device(device_name)
-    model = BoardTransformerPolicy(
-        channels=7,
-        height=height,
-        width=width,
-        d_model=d_model,
-        nhead=nhead,
-        layers=layers,
-        distance_bins=distance_bins,
-    )
-    model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
-    return model, height, width, device
+    model, height, width, checkpoint_args = load_checkpoint(Path(checkpoint_path), device)
+    return model, height, width, device, checkpoint_args
 
 
 def write_temp_puzzle(text: str) -> Path:
@@ -134,7 +112,7 @@ def load_puzzle_from_text(text: str) -> tuple[PushWorldPuzzle | None, Path | Non
 
 
 def rollout_policy(
-    model: BoardTransformerPolicy,
+    model: torch.nn.Module,
     puzzle: PushWorldPuzzle,
     puzzle_key: str,
     height: int,
@@ -144,6 +122,7 @@ def rollout_policy(
     beam_width: int,
     beam_depth: int,
     top_k: int,
+    repeat_penalty: float,
 ) -> dict[str, object]:
     state = puzzle.initial_state
     frames = [puzzle.render(state)]
@@ -171,6 +150,8 @@ def rollout_policy(
                 puzzle_key=puzzle_key,
                 encode_cache=encode_cache,
                 max_cache_entries=50_000,
+                seen_states=seen,
+                repeat_penalty=repeat_penalty,
             )
             next_state = puzzle.get_next_state(state, action)
             no_op = next_state == state
@@ -198,6 +179,7 @@ def rollout_policy(
         "rows": rows,
         "frames": frames,
         "repeated_states": repeated_states,
+        "repeat_penalty": repeat_penalty,
         "time_s": elapsed,
     }
 
@@ -298,6 +280,13 @@ def main() -> None:
         beam_width = st.number_input("Beam width", min_value=1, max_value=64, value=8, step=1)
         beam_depth = st.number_input("Beam depth", min_value=1, max_value=32, value=8, step=1)
         top_k = st.number_input("Top-k actions", min_value=1, max_value=4, value=3, step=1)
+        repeat_penalty = st.number_input(
+            "Repeat penalty",
+            min_value=0.0,
+            max_value=20.0,
+            value=0.0,
+            step=0.5,
+        )
         fps = st.slider("Playback FPS", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
 
         st.header("Planner")
@@ -338,7 +327,7 @@ def main() -> None:
 
     run_clicked = st.button("Run model rollout", type="primary")
     if run_clicked:
-        model, height, width, device = load_policy(str(checkpoint), device_name)
+        model, height, width, device, checkpoint_args = load_policy(str(checkpoint), device_name)
         if puzzle.dimensions[1] > height or puzzle.dimensions[0] > width:
             st.error(
                 f"Puzzle is larger than checkpoint padding: puzzle={puzzle.dimensions}, "
@@ -358,7 +347,9 @@ def main() -> None:
                 int(beam_width),
                 int(beam_depth),
                 int(top_k),
+                float(repeat_penalty),
             )
+        result["checkpoint_args"] = checkpoint_args
         st.session_state.last_rollout = result
         st.session_state.last_temp_path = temp_path
 
@@ -371,11 +362,12 @@ def main() -> None:
     if st.session_state.get("last_rollout") is not None:
         result = st.session_state.last_rollout
         st.subheader("Model Rollout")
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("Solved", "yes" if result["solved"] else "no")
         col2.metric("Steps", result["steps"])
         col3.metric("Repeated states", result["repeated_states"])
-        col4.metric("Inference time", f"{result['time_s']:.2f}s")
+        col4.metric("Repeat penalty", f"{float(result.get('repeat_penalty', 0.0)):.1f}")
+        col5.metric("Inference time", f"{result['time_s']:.2f}s")
 
         st.code(result["actions"] or "(no actions)", language="text")
         render_rollout_view(result, float(fps))

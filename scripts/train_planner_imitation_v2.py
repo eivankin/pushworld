@@ -9,6 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
+from planner_imitation_rollout import choose_action, encode_state
 from pushworld_study.paths import PROJECT_ROOT, ensure_upstream_pushworld_on_path
 
 
@@ -74,6 +76,12 @@ class ExpertStep:
     action: int
     remaining: int
     transforms: tuple[str, ...]
+
+
+class TrainingInterrupted(Exception):
+    def __init__(self, losses: list[float]) -> None:
+        super().__init__("Training interrupted")
+        self.losses = losses
 
 
 class ExpertDataset(Dataset):
@@ -230,21 +238,6 @@ def max_dimensions(paths: list[Path]) -> tuple[int, int]:
     return max(heights), max(widths)
 
 
-def set_cells(
-    planes: np.ndarray,
-    channel: int,
-    origin: tuple[int, int],
-    cells: set[tuple[int, int]],
-) -> None:
-    origin_x, origin_y = origin
-    _, height, width = planes.shape
-    for cell_x, cell_y in cells:
-        x = origin_x + cell_x
-        y = origin_y + cell_y
-        if 0 <= x < width and 0 <= y < height:
-            planes[channel, y, x] = 1.0
-
-
 def transform_action(action: int, transform: str) -> int:
     action_char = ACTION_INDEX_TO_CHAR[action]
     transformed_char = TRANSFORM_ACTION_MAP[transform][action_char]
@@ -277,40 +270,6 @@ def transform_encoded_state(
     output = np.zeros_like(planes)
     output[:, :transformed_height, :transformed_width] = transformed
     return output
-
-
-def encode_state(
-    puzzle: PushWorldPuzzle,
-    state: tuple[tuple[int, int], ...],
-    height: int,
-    width: int,
-) -> np.ndarray:
-    planes = np.zeros((7, height, width), dtype=np.float32)
-
-    for x, y in puzzle.wall_positions:
-        if 0 <= x < width and 0 <= y < height:
-            planes[0, y, x] = 1.0
-    for x, y in puzzle.agent_wall_positions:
-        if 0 <= x < width and 0 <= y < height:
-            planes[1, y, x] = 1.0
-
-    goal_count = len(puzzle.goal_state)
-    for movable_idx, movable in enumerate(puzzle.movable_objects):
-        if movable_idx == 0:
-            channel = 2
-        elif movable_idx <= goal_count:
-            channel = 3
-        else:
-            channel = 4
-        set_cells(planes, channel, state[movable_idx], movable.cells)
-
-    for goal_idx, goal in enumerate(puzzle.goal_state, start=1):
-        if goal_idx < len(puzzle.movable_objects):
-            set_cells(planes, 5, goal, puzzle.movable_objects[goal_idx].cells)
-            if state[goal_idx] == goal:
-                set_cells(planes, 6, goal, puzzle.movable_objects[goal_idx].cells)
-
-    return planes
 
 
 def solve_with_rgd(planner: Path, puzzle_path: Path, time_limit: float) -> Trajectory:
@@ -377,75 +336,103 @@ def train(
     beam_depth: int,
     top_k: int,
     max_cache_entries: int,
+    repeat_penalty: float,
     quick_eval_every: int,
     log_every_batches: int,
     amp: bool,
     seed: int,
+    start_epoch: int = 0,
+    initial_global_step: int = 0,
+    optimizer_state_dict: dict[str, object] | None = None,
+    scaler_state_dict: dict[str, object] | None = None,
     writer: object | None = None,
+    checkpoint_callback: Callable[
+        [int, float, nn.Module, torch.optim.Optimizer, torch.amp.GradScaler, int, str | None],
+        None,
+    ]
+    | None = None,
 ) -> list[float]:
     generator = torch.Generator()
     generator.manual_seed(seed)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=generator)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=amp and device.type == "cuda")
+    if optimizer_state_dict is not None:
+        optimizer.load_state_dict(optimizer_state_dict)
+    if scaler_state_dict is not None:
+        scaler.load_state_dict(scaler_state_dict)
     losses = []
-    global_step = 0
+    global_step = initial_global_step
     model.train()
-    progress = tqdm(range(epochs), desc="train", unit="epoch")
-    for _ in progress:
-        total_loss = 0.0
-        total_count = 0
-        batch_progress = tqdm(loader, desc=f"epoch {len(losses) + 1}/{epochs}", unit="batch", leave=False)
-        for states, actions, remaining in batch_progress:
-            global_step += 1
-            states = states.to(device)
-            actions = actions.to(device)
-            remaining = remaining.to(device).clamp_max(model.distance_head.out_features - 1)
-            with torch.amp.autocast("cuda", enabled=amp and device.type == "cuda"):
-                action_logits, distance_logits = model(states)
-                action_loss = nn.functional.cross_entropy(action_logits, actions)
-                distance_loss = nn.functional.cross_entropy(distance_logits, remaining)
-                loss = action_loss + distance_loss_weight * distance_loss
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            total_loss += float(loss.detach().cpu()) * states.shape[0]
-            total_count += states.shape[0]
-            batch_loss = float(loss.detach().cpu())
-            batch_progress.set_postfix(loss=f"{batch_loss:.4f}")
-            if writer is not None and log_every_batches > 0 and global_step % log_every_batches == 0:
-                writer.add_scalar("train/batch_loss", batch_loss, global_step)
-                writer.add_scalar("train/action_loss", float(action_loss.detach().cpu()), global_step)
-                writer.add_scalar("train/distance_loss", float(distance_loss.detach().cpu()), global_step)
-        epoch_loss = total_loss / max(1, total_count)
-        losses.append(epoch_loss)
-        if writer is not None:
-            writer.add_scalar("train/loss", epoch_loss, len(losses))
-            writer.add_scalar("train/global_step", global_step, len(losses))
-        progress.set_postfix(loss=f"{epoch_loss:.4f}")
-
-        if quick_eval_paths and quick_eval_every > 0 and len(losses) % quick_eval_every == 0:
-            quick_eval = evaluate(
-                model,
-                quick_eval_paths,
-                height,
-                width,
-                device,
-                max_steps,
-                beam_width,
-                beam_depth,
-                top_k,
-                f"quick epoch {len(losses)}",
-                max_cache_entries,
-                leave=False,
-            )
-            success_rate = quick_eval["solved"] / max(1, quick_eval["total"])
+    current_epoch = 0
+    total_loss = 0.0
+    total_count = 0
+    try:
+        progress = tqdm(range(start_epoch + 1, epochs + 1), desc="train", unit="epoch")
+        for epoch in progress:
+            current_epoch = epoch
+            total_loss = 0.0
+            total_count = 0
+            batch_progress = tqdm(loader, desc=f"epoch {current_epoch}/{epochs}", unit="batch", leave=False)
+            for states, actions, remaining in batch_progress:
+                global_step += 1
+                states = states.to(device)
+                actions = actions.to(device)
+                remaining = remaining.to(device).clamp_max(model.distance_head.out_features - 1)
+                with torch.amp.autocast("cuda", enabled=amp and device.type == "cuda"):
+                    action_logits, distance_logits = model(states)
+                    action_loss = nn.functional.cross_entropy(action_logits, actions)
+                    distance_loss = nn.functional.cross_entropy(distance_logits, remaining)
+                    loss = action_loss + distance_loss_weight * distance_loss
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                total_loss += float(loss.detach().cpu()) * states.shape[0]
+                total_count += states.shape[0]
+                batch_loss = float(loss.detach().cpu())
+                batch_progress.set_postfix(loss=f"{batch_loss:.4f}")
+                if writer is not None and log_every_batches > 0 and global_step % log_every_batches == 0:
+                    writer.add_scalar("train/batch_loss", batch_loss, global_step)
+                    writer.add_scalar("train/action_loss", float(action_loss.detach().cpu()), global_step)
+                    writer.add_scalar("train/distance_loss", float(distance_loss.detach().cpu()), global_step)
+            epoch_loss = total_loss / max(1, total_count)
+            losses.append(epoch_loss)
             if writer is not None:
-                writer.add_scalar("eval_quick/level0_solved", quick_eval["solved"], len(losses))
-                writer.add_scalar("eval_quick/level0_total", quick_eval["total"], len(losses))
-                writer.add_scalar("eval_quick/level0_success_rate", success_rate, len(losses))
-            model.train()
+                writer.add_scalar("train/loss", epoch_loss, current_epoch)
+                writer.add_scalar("train/global_step", global_step, current_epoch)
+            progress.set_postfix(loss=f"{epoch_loss:.4f}")
+
+            if quick_eval_paths and quick_eval_every > 0 and current_epoch % quick_eval_every == 0:
+                quick_eval = evaluate(
+                    model,
+                    quick_eval_paths,
+                    height,
+                    width,
+                    device,
+                    max_steps,
+                    beam_width,
+                    beam_depth,
+                    top_k,
+                    f"quick epoch {current_epoch}",
+                    max_cache_entries,
+                    repeat_penalty,
+                    leave=False,
+                )
+                success_rate = quick_eval["solved"] / max(1, quick_eval["total"])
+                if writer is not None:
+                    writer.add_scalar("eval_quick/level0_solved", quick_eval["solved"], current_epoch)
+                    writer.add_scalar("eval_quick/level0_total", quick_eval["total"], current_epoch)
+                    writer.add_scalar("eval_quick/level0_success_rate", success_rate, current_epoch)
+                model.train()
+            if checkpoint_callback is not None:
+                checkpoint_callback(current_epoch, epoch_loss, model, optimizer, scaler, global_step, None)
+    except KeyboardInterrupt as exc:
+        partial_loss = total_loss / total_count if total_count > 0 else (losses[-1] if losses else float("nan"))
+        interrupt_epoch = max(current_epoch, start_epoch + len(losses) + 1)
+        if checkpoint_callback is not None:
+            checkpoint_callback(interrupt_epoch, partial_loss, model, optimizer, scaler, global_step, "interrupted")
+        raise TrainingInterrupted(losses) from exc
     return losses
 
 
@@ -475,6 +462,7 @@ def evaluate(
     top_k: int,
     label: str,
     max_cache_entries: int,
+    repeat_penalty: float = 0.0,
     leave: bool = True,
 ) -> dict[str, object]:
     model.eval()
@@ -506,6 +494,8 @@ def evaluate(
                     puzzle_key=str(path),
                     encode_cache=encode_cache,
                     max_cache_entries=max_cache_entries,
+                    seen_states=seen,
+                    repeat_penalty=repeat_penalty,
                 )
                 actions.append(ACTION_CHARS[action])
                 state = puzzle.get_next_state(state, action)
@@ -535,142 +525,9 @@ def evaluate(
         "total": len(puzzle_paths),
         "time_s": time.perf_counter() - start,
         "cache_entries": len(encode_cache),
+        "repeat_penalty": repeat_penalty,
         "results": results,
     }
-
-
-def encode_cached(
-    puzzle: PushWorldPuzzle,
-    puzzle_key: str,
-    state: tuple[tuple[int, int], ...],
-    height: int,
-    width: int,
-    cache: dict[tuple[str, tuple[tuple[int, int], ...]], torch.Tensor],
-    max_cache_entries: int,
-) -> torch.Tensor:
-    key = (puzzle_key, state)
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-    encoded = torch.from_numpy(encode_state(puzzle, state, height, width))
-    if max_cache_entries > 0 and len(cache) < max_cache_entries:
-        cache[key] = encoded
-    return encoded
-
-
-def predict_batch(
-    model: nn.Module,
-    puzzle_states: list[tuple[PushWorldPuzzle, str, tuple[tuple[int, int], ...]]],
-    height: int,
-    width: int,
-    device: torch.device,
-    encode_cache: dict[tuple[str, tuple[tuple[int, int], ...]], torch.Tensor],
-    max_cache_entries: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    encoded = [
-        encode_cached(puzzle, puzzle_key, state, height, width, encode_cache, max_cache_entries)
-        for puzzle, puzzle_key, state in puzzle_states
-    ]
-    batch = torch.stack(encoded).to(device)
-    action_logits, distance_logits = model(batch)
-    action_log_probs = torch.log_softmax(action_logits, dim=-1)
-    distance_probs = torch.softmax(distance_logits, dim=-1)
-    distances = torch.arange(distance_logits.shape[-1], device=device, dtype=torch.float32)
-    expected_distance = torch.sum(distance_probs * distances.unsqueeze(0), dim=-1)
-    return action_log_probs.cpu(), expected_distance.cpu()
-
-
-def choose_action(
-    model: nn.Module,
-    puzzle: PushWorldPuzzle,
-    state: tuple[tuple[int, int], ...],
-    height: int,
-    width: int,
-    device: torch.device,
-    beam_width: int,
-    beam_depth: int,
-    top_k: int,
-    puzzle_key: str,
-    encode_cache: dict[tuple[str, tuple[tuple[int, int], ...]], torch.Tensor],
-    max_cache_entries: int,
-) -> int:
-    if beam_width <= 1 or beam_depth <= 1:
-        action_log_probs, _ = predict_batch(
-            model,
-            [(puzzle, puzzle_key, state)],
-            height,
-            width,
-            device,
-            encode_cache,
-            max_cache_entries,
-        )
-        for action in torch.argsort(action_log_probs[0], descending=True).tolist():
-            if puzzle.get_next_state(state, int(action)) != state:
-                return int(action)
-        return int(torch.argmax(action_log_probs[0]).item())
-
-    beams: list[tuple[tuple[tuple[int, int], ...], tuple[int, ...], float]] = [(state, (), 0.0)]
-    best_solved: tuple[int, ...] | None = None
-    best_nonempty_path: tuple[int, ...] | None = None
-    for _ in range(beam_depth):
-        predictions = predict_batch(
-            model,
-            [(puzzle, puzzle_key, beam_state) for beam_state, _, _ in beams],
-            height,
-            width,
-            device,
-            encode_cache,
-            max_cache_entries,
-        )
-        action_log_probs, _ = predictions
-        candidates_by_state: dict[
-            tuple[tuple[int, int], ...],
-            tuple[tuple[tuple[int, int], ...], tuple[int, ...], float],
-        ] = {}
-        for beam_idx, (beam_state, path, score) in enumerate(beams):
-            action_count = min(top_k, len(ACTION_NAMES))
-            top_actions = torch.topk(action_log_probs[beam_idx], k=action_count).indices.tolist()
-            for action in top_actions:
-                next_state = puzzle.get_next_state(beam_state, int(action))
-                if next_state == beam_state:
-                    continue
-                next_path = path + (int(action),)
-                best_nonempty_path = best_nonempty_path or next_path
-                next_score = score - float(action_log_probs[beam_idx, action])
-                if puzzle.is_goal_state(next_state):
-                    best_solved = next_path
-                    break
-                previous = candidates_by_state.get(next_state)
-                if previous is None or next_score < previous[2]:
-                    candidates_by_state[next_state] = (next_state, next_path, next_score)
-            if best_solved is not None:
-                break
-        if best_solved is not None:
-            return best_solved[0]
-        candidates = list(candidates_by_state.values())
-        if not candidates:
-            break
-        leaf_log_probs, leaf_distances = predict_batch(
-            model,
-            [(puzzle, puzzle_key, candidate[0]) for candidate in candidates],
-            height,
-            width,
-            device,
-            encode_cache,
-            max_cache_entries,
-        )
-        del leaf_log_probs
-        ranked = sorted(
-            zip(candidates, leaf_distances.tolist(), strict=True),
-            key=lambda item: item[0][2] + 0.15 * float(item[1]),
-        )
-        beams = [candidate for candidate, _ in ranked[:beam_width]]
-
-    if beams and beams[0][1]:
-        return beams[0][1][0]
-    if best_nonempty_path:
-        return best_nonempty_path[0]
-    return Actions.LEFT
 
 
 def main() -> None:
@@ -730,12 +587,38 @@ def main() -> None:
     parser.add_argument("--beam-width", type=int, default=8)
     parser.add_argument("--beam-depth", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument(
+        "--repeat-penalty",
+        type=float,
+        default=0.0,
+        help="Add this beam cost when a rollout candidate revisits a state already seen in the current rollout.",
+    )
     parser.add_argument("--eval-every", type=int, default=0, help="Run quick held-out Level 0 eval every N epochs; 0 disables it.")
     parser.add_argument("--eval-puzzles", type=int, default=50, help="Number of held-out Level 0 puzzles for periodic quick eval.")
     parser.add_argument("--log-every-batches", type=int, default=10, help="Log batch losses to TensorBoard every N optimizer steps; 0 disables batch logging.")
     parser.add_argument("--max-cache-entries", type=int, default=250_000)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--model-output", type=Path, default=None)
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        help="Resume model weights, optimizer/scaler state, epoch, and global step from a saved checkpoint.",
+    )
+    parser.add_argument(
+        "--epoch-checkpoint-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for per-epoch checkpoints. If omitted and --model-output "
+            "is set, uses '<model-output stem>_epochs' next to --model-output."
+        ),
+    )
+    parser.add_argument(
+        "--no-epoch-checkpoints",
+        action="store_true",
+        help="Disable automatic per-epoch checkpoints.",
+    )
     parser.add_argument("--tensorboard-log", type=Path, default=None)
     parser.add_argument("--skip-train-eval", action="store_true")
     parser.add_argument("--print-expert-plans", action="store_true")
@@ -748,6 +631,8 @@ def main() -> None:
     set_seed(args.seed)
     if args.planner_workers < 1:
         raise ValueError("--planner-workers must be >= 1")
+    if args.repeat_penalty < 0.0:
+        raise ValueError("--repeat-penalty must be >= 0")
 
     if args.augment_transforms == "all":
         train_transforms = SYMMETRY_TRANSFORMS if args.level0_symmetry_augment else ("r0",)
@@ -786,7 +671,10 @@ def main() -> None:
     print("train_dirs=" + json.dumps([str(path) for path in train_dirs], indent=2))
     print("test_dirs=" + json.dumps([str(path) for path in test_dirs], indent=2))
     print(f"level0_symmetry_augment={args.level0_symmetry_augment} transforms={list(train_transforms)}")
-    print(f"board={height}x{width} planner={args.planner} planner_workers={args.planner_workers}")
+    print(
+        f"board={height}x{width} planner={args.planner} "
+        f"planner_workers={args.planner_workers} repeat_penalty={args.repeat_penalty}"
+    )
     writer = make_tensorboard_writer(args.tensorboard_log)
     if writer is not None:
         writer.add_text("config/args", json.dumps({k: str(v) for k, v in vars(args).items()}, indent=2))
@@ -855,32 +743,130 @@ def main() -> None:
         layers=args.layers,
         distance_bins=args.max_steps + 1,
     ).to(device)
+    resume_epoch = 0
+    resume_global_step = 0
+    resume_optimizer_state: dict[str, object] | None = None
+    resume_scaler_state: dict[str, object] | None = None
+    if args.resume_checkpoint is not None:
+        resume_checkpoint = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
+        checkpoint_height = int(resume_checkpoint["height"])
+        checkpoint_width = int(resume_checkpoint["width"])
+        if checkpoint_height != height or checkpoint_width != width:
+            raise ValueError(
+                f"Resume checkpoint board {checkpoint_height}x{checkpoint_width} does not match "
+                f"current board {height}x{width}. Use the same train/eval dirs and augmentation padding."
+            )
+        model.load_state_dict(resume_checkpoint["model_state_dict"])
+        resume_epoch = int(resume_checkpoint.get("epoch", 0) or 0)
+        resume_global_step = int(resume_checkpoint.get("global_step", 0) or 0)
+        resume_optimizer_state = resume_checkpoint.get("optimizer_state_dict")
+        resume_scaler_state = resume_checkpoint.get("scaler_state_dict")
+        print(
+            f"resumed checkpoint={args.resume_checkpoint} "
+            f"epoch={resume_epoch} global_step={resume_global_step} "
+            f"optimizer={'yes' if resume_optimizer_state is not None else 'no'} "
+            f"scaler={'yes' if resume_scaler_state is not None else 'no'}"
+        )
+        if resume_epoch >= args.epochs:
+            print(f"resume epoch {resume_epoch} is >= requested --epochs {args.epochs}; no training batches will run")
     quick_eval_paths = test_paths[: args.eval_puzzles] if args.eval_every > 0 else []
 
+    epoch_checkpoint_dir = args.epoch_checkpoint_dir
+    if epoch_checkpoint_dir is None and args.model_output is not None and not args.no_epoch_checkpoints:
+        epoch_checkpoint_dir = args.model_output.parent / f"{args.model_output.stem}_epochs"
+
+    def save_checkpoint(
+        path: Path,
+        epoch: int | None = None,
+        epoch_loss: float | None = None,
+        optimizer: torch.optim.Optimizer | None = None,
+        scaler: torch.amp.GradScaler | None = None,
+        global_step: int | None = None,
+        interrupted: bool = False,
+    ) -> None:
+        payload: dict[str, object] = {
+            "model_state_dict": model.state_dict(),
+            "height": height,
+            "width": width,
+            "channels": 7,
+            "args": vars(args),
+        }
+        if epoch is not None:
+            payload["epoch"] = epoch
+        if epoch_loss is not None:
+            payload["epoch_loss"] = epoch_loss
+        if optimizer is not None:
+            payload["optimizer_state_dict"] = optimizer.state_dict()
+        if scaler is not None:
+            payload["scaler_state_dict"] = scaler.state_dict()
+        if global_step is not None:
+            payload["global_step"] = global_step
+        payload["interrupted"] = interrupted
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, path)
+
+    def save_epoch_checkpoint(
+        epoch: int,
+        epoch_loss: float,
+        _model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scaler: torch.amp.GradScaler,
+        global_step: int,
+        tag: str | None,
+    ) -> None:
+        del _model
+        if epoch_checkpoint_dir is None or args.no_epoch_checkpoints:
+            return
+        filename = f"{tag}_epoch_{epoch:03d}.pt" if tag else f"epoch_{epoch:03d}.pt"
+        path = epoch_checkpoint_dir / filename
+        save_checkpoint(path, epoch, epoch_loss, optimizer, scaler, global_step, interrupted=tag == "interrupted")
+        if writer is not None:
+            writer.add_text("checkpoint/latest_epoch", str(path), epoch)
+        print(f"wrote {path}")
+
     train_start = time.perf_counter()
-    losses = train(
-        model,
-        dataset,
-        device,
-        args.epochs,
-        args.batch_size,
-        args.lr,
-        args.distance_loss_weight,
-        quick_eval_paths,
-        height,
-        width,
-        args.max_steps,
-        args.beam_width,
-        args.beam_depth,
-        args.top_k,
-        args.max_cache_entries,
-        args.eval_every,
-        args.log_every_batches,
-        args.amp,
-        args.seed,
-        writer,
-    )
+    interrupted = False
+    try:
+        losses = train(
+            model,
+            dataset,
+            device,
+            args.epochs,
+            args.batch_size,
+            args.lr,
+            args.distance_loss_weight,
+            quick_eval_paths,
+            height,
+            width,
+            args.max_steps,
+            args.beam_width,
+            args.beam_depth,
+            args.top_k,
+            args.max_cache_entries,
+            args.repeat_penalty,
+            args.eval_every,
+            args.log_every_batches,
+            args.amp,
+            args.seed,
+            resume_epoch,
+            resume_global_step,
+            resume_optimizer_state,
+            resume_scaler_state,
+            writer,
+            save_epoch_checkpoint,
+        )
+    except TrainingInterrupted as exc:
+        losses = exc.losses
+        interrupted = True
     train_time = time.perf_counter() - train_start
+
+    if interrupted:
+        print("training interrupted; saved interrupt checkpoint and skipped final evaluation")
+        if writer is not None:
+            writer.add_scalar("time/train_s", train_time, 0)
+            writer.flush()
+            writer.close()
+        return
 
     if args.skip_train_eval:
         train_eval = {"skipped": True, "solved": None, "total": len(train_paths)}
@@ -897,6 +883,7 @@ def main() -> None:
             args.top_k,
             "train",
             args.max_cache_entries,
+            args.repeat_penalty,
         )
     test_eval = evaluate(
         model,
@@ -910,6 +897,7 @@ def main() -> None:
         args.top_k,
         "level0 test",
         args.max_cache_entries,
+        args.repeat_penalty,
     )
     level1_eval = evaluate(
         model,
@@ -923,6 +911,7 @@ def main() -> None:
         args.top_k,
         "level1",
         args.max_cache_entries,
+        args.repeat_penalty,
     )
 
     def compact_eval(payload: dict[str, object]) -> dict[str, object]:
@@ -959,6 +948,7 @@ def main() -> None:
         "amp": args.amp,
         "seed": args.seed,
         "planner_workers": args.planner_workers,
+        "repeat_penalty": args.repeat_penalty,
         "max_cache_entries": args.max_cache_entries,
         "train_eval": compact_eval(train_eval),
         "level0_test_eval": compact_eval(test_eval),
@@ -990,17 +980,7 @@ def main() -> None:
         args.output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         print(f"wrote {args.output}")
     if args.model_output is not None:
-        args.model_output.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "height": height,
-                "width": width,
-                "channels": 7,
-                "args": vars(args),
-            },
-            args.model_output,
-        )
+        save_checkpoint(args.model_output)
         print(f"wrote {args.model_output}")
 
 
