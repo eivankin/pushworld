@@ -29,9 +29,21 @@ ensure_upstream_pushworld_on_path()
 from pushworld.puzzle import Actions, PushWorldPuzzle  # noqa: E402
 
 
-DEFAULT_CHECKPOINT = PROJECT_ROOT / "models/planner_imitation_level0_base_small.pt"
 DEFAULT_PLANNER = PROJECT_ROOT / "external/pushworld/cpp/build/bin/run_planner"
-LEVEL0_BASE_TEST = PROJECT_ROOT / "data/level0/base/test"
+CHECKPOINT_OPTIONS = {
+    "Multi4 Level-0": PROJECT_ROOT / "models/planner_imitation_level0_multi4.pt",
+    "Base Level-0 2k": PROJECT_ROOT / "models/planner_imitation_level0_base_small.pt",
+}
+LEVEL0_TEST_DIRS = {
+    "base": PROJECT_ROOT / "data/level0/base/test",
+    "all": PROJECT_ROOT / "data/level0/all/test",
+    "goals": PROJECT_ROOT / "data/level0/goals/test",
+    "obstacles": PROJECT_ROOT / "data/level0/obstacles/test",
+    "shapes": PROJECT_ROOT / "data/level0/shapes/test",
+    "size": PROJECT_ROOT / "data/level0/size/test",
+    "walls": PROJECT_ROOT / "data/level0/walls/test",
+}
+LEVEL0_BASE_TEST = LEVEL0_TEST_DIRS["base"]
 LEVEL1 = PROJECT_ROOT / "external/pushworld/benchmark/puzzles/level1"
 LEGEND = {
     ".": "empty cell",
@@ -184,7 +196,44 @@ def rollout_policy(
     }
 
 
-def run_rgd(planner: Path, puzzle_path: Path, time_limit: float) -> dict[str, object]:
+def rollout_plan(puzzle: PushWorldPuzzle, plan: str) -> dict[str, object]:
+    state = puzzle.initial_state
+    frames = [puzzle.render(state)]
+    rows = []
+    seen = {state}
+    repeated_states = 0
+    for step_idx, action_char in enumerate(plan):
+        action = Actions.FROM_CHAR[action_char]
+        achieved_before = puzzle.count_achieved_goals(state)
+        next_state = puzzle.get_next_state(state, action)
+        no_op = next_state == state
+        repeated = next_state in seen
+        repeated_states += int(repeated)
+        rows.append(
+            {
+                "step": step_idx + 1,
+                "action": action_char,
+                "action_name": ["left", "right", "up", "down"][action],
+                "no_op": no_op,
+                "repeated_state": repeated,
+                "goals_before": achieved_before,
+                "goals_after": puzzle.count_achieved_goals(next_state),
+            }
+        )
+        state = next_state
+        seen.add(state)
+        frames.append(puzzle.render(state))
+    return {
+        "solved": puzzle.is_goal_state(state),
+        "steps": len(rows),
+        "actions": plan,
+        "rows": rows,
+        "frames": frames,
+        "repeated_states": repeated_states,
+    }
+
+
+def run_rgd(planner: Path, puzzle: PushWorldPuzzle, puzzle_path: Path, time_limit: float) -> dict[str, object]:
     start = time.perf_counter()
     try:
         result = subprocess.run(
@@ -195,37 +244,72 @@ def run_rgd(planner: Path, puzzle_path: Path, time_limit: float) -> dict[str, ob
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return {"solved": False, "plan": "", "time_s": time.perf_counter() - start, "status": "timeout"}
+        return {
+            "solved": False,
+            "plan": "",
+            "time_s": time.perf_counter() - start,
+            "status": "timeout",
+            "frames": [],
+            "rows": [],
+            "repeated_states": 0,
+        }
 
     elapsed = time.perf_counter() - start
     plan = result.stdout.strip()
     solved = result.returncode == 0 and bool(plan) and set(plan).issubset(set(ACTION_CHARS))
+    rollout = rollout_plan(puzzle, plan) if solved else {"frames": [], "rows": [], "repeated_states": 0}
     return {
         "solved": solved,
         "plan": plan if solved else "",
         "time_s": elapsed,
         "status": "solved" if solved else result.stdout.strip() or result.stderr.strip() or "failed",
+        **rollout,
     }
 
 
-def render_rollout_view(result: dict[str, object], fps: float) -> None:
+def render_rollout_view(result: dict[str, object], fps: float, key_prefix: str) -> None:
     frames = result["frames"]
     if not frames:
         return
+    playing_key = f"{key_prefix}_playing"
+    frame_key = f"{key_prefix}_frame"
+    st.session_state.setdefault(playing_key, False)
+    st.session_state.setdefault(frame_key, 0)
+
     frame_placeholder = st.empty()
     max_idx = len(frames) - 1
-    selected = st.slider("Step", min_value=0, max_value=max_idx, value=0)
+    selected = st.slider(
+        "Step",
+        min_value=0,
+        max_value=max_idx,
+        value=min(int(st.session_state[frame_key]), max_idx),
+        key=f"{key_prefix}_step_slider",
+    )
+    st.session_state[frame_key] = selected
     frame_placeholder.image(frames[selected], caption=f"Step {selected}", use_container_width=False)
 
-    col_a, col_b = st.columns(2)
+    col_a, col_b, col_c = st.columns(3)
     with col_a:
-        if st.button("Play rollout"):
-            delay = 1.0 / max(fps, 0.1)
-            for idx, frame in enumerate(frames):
-                frame_placeholder.image(frame, caption=f"Step {idx}", use_container_width=False)
-                time.sleep(delay)
+        if st.button("Play rollout", key=f"{key_prefix}_play"):
+            st.session_state[playing_key] = True
+            st.rerun()
     with col_b:
+        if st.button("Stop", key=f"{key_prefix}_stop"):
+            st.session_state[playing_key] = False
+            st.rerun()
+    with col_c:
         st.metric("Playback FPS", f"{fps:.1f}")
+
+    if st.session_state[playing_key]:
+        delay = 1.0 / max(fps, 0.1)
+        start_idx = min(int(st.session_state[frame_key]), max_idx)
+        for idx in range(start_idx, len(frames)):
+            if not st.session_state.get(playing_key, False):
+                break
+            st.session_state[frame_key] = idx
+            frame_placeholder.image(frames[idx], caption=f"Step {idx}", use_container_width=False)
+            time.sleep(delay)
+        st.session_state[playing_key] = False
 
 
 def main() -> None:
@@ -254,13 +338,19 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Model")
-        checkpoint = Path(st.text_input("Checkpoint", str(DEFAULT_CHECKPOINT)))
+        checkpoint_name = st.selectbox("Checkpoint", list(CHECKPOINT_OPTIONS), index=0)
+        checkpoint = CHECKPOINT_OPTIONS[checkpoint_name]
+        st.caption(str(checkpoint.relative_to(PROJECT_ROOT) if checkpoint.is_relative_to(PROJECT_ROOT) else checkpoint))
         device_default = "cuda" if torch.cuda.is_available() else "cpu"
         device_name = st.selectbox("Device", ["cuda", "cpu"] if torch.cuda.is_available() else ["cpu"], index=0 if device_default == "cuda" else 0)
 
         st.header("Puzzle")
-        split = st.selectbox("Split", ["Level 0 base test", "Level 1"])
-        puzzle_dir = LEVEL0_BASE_TEST if split == "Level 0 base test" else LEVEL1
+        split = st.selectbox("Split", ["Level 0 test", "Level 1"])
+        if split == "Level 0 test":
+            level0_variant = st.selectbox("Level 0 set", list(LEVEL0_TEST_DIRS), index=0)
+            puzzle_dir = LEVEL0_TEST_DIRS[level0_variant]
+        else:
+            puzzle_dir = LEVEL1
         puzzles = list_puzzles(puzzle_dir)
         names = [path.name for path in puzzles]
 
@@ -355,7 +445,7 @@ def main() -> None:
 
         if compare_rgd:
             with st.spinner("Running RGD comparison..."):
-                st.session_state.last_rgd = run_rgd(DEFAULT_PLANNER, temp_path, float(planner_timeout))
+                st.session_state.last_rgd = run_rgd(DEFAULT_PLANNER, puzzle, temp_path, float(planner_timeout))
         else:
             st.session_state.last_rgd = None
 
@@ -370,17 +460,32 @@ def main() -> None:
         col5.metric("Inference time", f"{result['time_s']:.2f}s")
 
         st.code(result["actions"] or "(no actions)", language="text")
-        render_rollout_view(result, float(fps))
+        render_rollout_view(result, float(fps), "model")
         st.dataframe(pd.DataFrame(result["rows"]), use_container_width=True)
 
     if st.session_state.get("last_rgd") is not None:
         rgd = st.session_state.last_rgd
         st.subheader("RGD Comparison")
-        col1, col2, col3 = st.columns(3)
+        model_result = st.session_state.get("last_rollout")
+        both_solved = bool(model_result and model_result.get("solved") and rgd.get("solved"))
+        length_delta = int(model_result["steps"]) - len(rgd["plan"]) if both_solved else None
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("RGD status", rgd["status"])
         col2.metric("Plan length", len(rgd["plan"]))
-        col3.metric("Solve time", f"{rgd['time_s']:.3f}s")
+        col3.metric("Repeated states", rgd.get("repeated_states", 0))
+        col4.metric("Model - RGD", "n/a" if length_delta is None else f"{length_delta:+d}")
+        col5.metric("Solve time", f"{rgd['time_s']:.3f}s")
+        if length_delta is not None:
+            if length_delta < 0:
+                st.success(f"Model found a shorter solved rollout by {-length_delta} steps.")
+            elif length_delta > 0:
+                st.info(f"RGD plan is shorter by {length_delta} steps.")
+            else:
+                st.info("Model and RGD used the same number of steps.")
         st.code(rgd["plan"] or "(no plan)", language="text")
+        if rgd.get("frames"):
+            render_rollout_view(rgd, float(fps), "rgd")
+            st.dataframe(pd.DataFrame(rgd["rows"]), use_container_width=True)
 
 
 if __name__ == "__main__":
