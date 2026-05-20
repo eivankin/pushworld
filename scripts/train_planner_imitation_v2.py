@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
+import os
 import random
 import re
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -17,10 +22,21 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
-from planner_imitation_rollout import choose_action, encode_state
+from planner_imitation_rollout import (
+    BEAM_SCORE_MODES,
+    DISTANCE_TARGETS,
+    RolloutProfile,
+    auto_distance_bins,
+    best_first_search,
+    choose_action,
+    distance_targets,
+    encode_state,
+)
 from pushworld_study.paths import PROJECT_ROOT, ensure_upstream_pushworld_on_path
 
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TENSORBOARD_BINARY", "")
 ensure_upstream_pushworld_on_path()
 
 from pushworld.puzzle import Actions, PushWorldPuzzle  # noqa: E402
@@ -40,6 +56,7 @@ SYMMETRY_TRANSFORMS = (
 )
 ACTION_CHAR_TO_INDEX = {char: idx for idx, char in enumerate(ACTION_CHARS)}
 ACTION_INDEX_TO_CHAR = {idx: char for idx, char in enumerate(ACTION_CHARS)}
+CACHE_SCHEMA_VERSION = 1
 TRANSFORM_ACTION_MAP = {
     "r0": {"L": "L", "R": "R", "U": "U", "D": "D"},
     "r90": {"L": "U", "R": "D", "U": "R", "D": "L"},
@@ -58,6 +75,12 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def default_planner_path() -> Path:
+    base = PROJECT_ROOT / "external/pushworld/cpp/build/bin/run_planner"
+    exe = base.with_suffix(".exe")
+    return exe if exe.exists() else base
 
 
 @dataclass(frozen=True)
@@ -92,20 +115,33 @@ class ExpertDataset(Dataset):
         width: int,
         transforms: tuple[str, ...] = ("r0",),
         transform_level0_only: bool = False,
+        transform_mode: str = "random",
         seed: int = 1,
     ) -> None:
+        if transform_mode not in {"random", "exhaustive"}:
+            raise ValueError(f"Unknown transform_mode={transform_mode!r}")
         self.steps: list[ExpertStep] = []
         self.height = height
         self.width = width
         self.transforms = transforms
         self.transform_level0_only = transform_level0_only
+        self.transform_mode = transform_mode
         self.base_examples = 0
         self.augmented_base_examples = 0
         self.unaugmented_base_examples = 0
         self.rng = random.Random(seed)
+        self.profile: dict[str, float] = {
+            "dataset_materialization_time_s": 0.0,
+            "puzzle_parse_time_s": 0.0,
+            "state_encode_time_s": 0.0,
+            "env_step_time_s": 0.0,
+        }
 
+        materialize_start = time.perf_counter()
         for trajectory in trajectories:
+            parse_start = time.perf_counter()
             puzzle = PushWorldPuzzle(str(trajectory.puzzle_path))
+            self.profile["puzzle_parse_time_s"] += time.perf_counter() - parse_start
             puzzle_width, puzzle_height = puzzle.dimensions
             state = puzzle.initial_state
             plan_length = len(trajectory.plan)
@@ -116,24 +152,33 @@ class ExpertDataset(Dataset):
                 action = Actions.FROM_CHAR[action_char]
                 remaining = plan_length - step_idx
                 self.base_examples += 1
-                if len(trajectory_transforms) > 1:
-                    self.augmented_base_examples += 1
-                else:
-                    self.unaugmented_base_examples += 1
-                self.steps.append(
-                    ExpertStep(
-                        puzzle=puzzle,
-                        puzzle_height=puzzle_height,
-                        puzzle_width=puzzle_width,
-                        state=state,
-                        action=action,
-                        remaining=remaining,
-                        transforms=trajectory_transforms,
-                    )
+                item_transforms = (
+                    tuple((transform_name,) for transform_name in trajectory_transforms)
+                    if transform_mode == "exhaustive"
+                    else (trajectory_transforms,)
                 )
+                for transforms_for_item in item_transforms:
+                    if len(trajectory_transforms) > 1:
+                        self.augmented_base_examples += 1
+                    else:
+                        self.unaugmented_base_examples += 1
+                    self.steps.append(
+                        ExpertStep(
+                            puzzle=puzzle,
+                            puzzle_height=puzzle_height,
+                            puzzle_width=puzzle_width,
+                            state=state,
+                            action=action,
+                            remaining=remaining,
+                            transforms=transforms_for_item,
+                        )
+                    )
+                step_start = time.perf_counter()
                 state = puzzle.get_next_state(state, action)
+                self.profile["env_step_time_s"] += time.perf_counter() - step_start
             if not puzzle.is_goal_state(state):
                 raise ValueError(f"Planner trace does not solve {trajectory.puzzle_path}")
+        self.profile["dataset_materialization_time_s"] = time.perf_counter() - materialize_start
 
     def __len__(self) -> int:
         return len(self.steps)
@@ -157,6 +202,100 @@ class ExpertDataset(Dataset):
         )
 
 
+class CachedExpertDataset(Dataset):
+    def __init__(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        remaining: torch.Tensor,
+        puzzle_heights: torch.Tensor,
+        puzzle_widths: torch.Tensor,
+        puzzle_indices: torch.Tensor,
+        puzzle_paths: list[Path],
+        height: int,
+        width: int,
+        transforms: tuple[str, ...] = ("r0",),
+        transform_level0_only: bool = False,
+        transform_mode: str = "random",
+        seed: int = 1,
+        profile: dict[str, float] | None = None,
+    ) -> None:
+        if transform_mode not in {"random", "exhaustive"}:
+            raise ValueError(f"Unknown transform_mode={transform_mode!r}")
+        self.states = states.cpu()
+        self.actions = actions.cpu()
+        self.remaining = remaining.cpu()
+        self.puzzle_heights = puzzle_heights.cpu()
+        self.puzzle_widths = puzzle_widths.cpu()
+        self.puzzle_indices = puzzle_indices.cpu()
+        self.puzzle_paths = puzzle_paths
+        self.height = height
+        self.width = width
+        self.transforms = transforms
+        self.transform_level0_only = transform_level0_only
+        self.transform_mode = transform_mode
+        self.rng = random.Random(seed)
+        self.profile = profile or {
+            "dataset_materialization_time_s": 0.0,
+            "puzzle_parse_time_s": 0.0,
+            "state_encode_time_s": 0.0,
+            "env_step_time_s": 0.0,
+        }
+        self.base_examples = int(self.actions.numel())
+        self.items: list[tuple[int, str | None]] = []
+        self.augmented_base_examples = 0
+        self.unaugmented_base_examples = 0
+        for idx in range(self.base_examples):
+            transforms_for_item = self._transforms_for_base_index(idx)
+            if self.transform_mode == "exhaustive":
+                for transform_name in transforms_for_item:
+                    self.items.append((idx, transform_name))
+                    if len(transforms_for_item) > 1:
+                        self.augmented_base_examples += 1
+                    else:
+                        self.unaugmented_base_examples += 1
+            else:
+                self.items.append((idx, None))
+                if len(transforms_for_item) > 1:
+                    self.augmented_base_examples += 1
+                else:
+                    self.unaugmented_base_examples += 1
+
+    def _transforms_for_base_index(self, idx: int) -> tuple[str, ...]:
+        puzzle_path = self.puzzle_paths[int(self.puzzle_indices[idx])]
+        if self.transform_level0_only and not is_level0_path(puzzle_path):
+            return ("r0",)
+        return self.transforms
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        base_idx, fixed_transform = self.items[idx]
+        transforms = self._transforms_for_base_index(base_idx)
+        transform = fixed_transform or (self.rng.choice(transforms) if len(transforms) > 1 else "r0")
+        action = int(self.actions[base_idx])
+        if transform == "r0":
+            state = self.states[base_idx].float()
+        else:
+            state = torch.from_numpy(
+                transform_encoded_state(
+                    self.states[base_idx].numpy(),
+                    puzzle_height=int(self.puzzle_heights[base_idx]),
+                    puzzle_width=int(self.puzzle_widths[base_idx]),
+                    height=self.height,
+                    width=self.width,
+                    transform=transform,
+                )
+            ).float()
+            action = transform_action(action, transform)
+        return (
+            state,
+            torch.tensor(action, dtype=torch.long),
+            self.remaining[base_idx].long(),
+        )
+
+
 def is_level0_path(path: Path) -> bool:
     try:
         path.resolve().relative_to((PROJECT_ROOT / "data/level0").resolve())
@@ -175,18 +314,31 @@ class BoardTransformerPolicy(nn.Module):
         nhead: int = 4,
         layers: int = 2,
         distance_bins: int = 101,
+        encoder_stem: str = "linear",
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if encoder_stem not in ("linear", "conv"):
+            raise ValueError("--encoder-stem must be either 'linear' or 'conv'")
         self.height = height
         self.width = width
-        self.token_proj = nn.Linear(channels, d_model)
+        self.encoder_stem = encoder_stem
+        if encoder_stem == "conv":
+            self.conv_stem = nn.Sequential(
+                nn.Conv2d(channels, d_model, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(d_model, d_model, kernel_size=3, padding=1),
+                nn.GELU(),
+            )
+        else:
+            self.token_proj = nn.Linear(channels, d_model)
         self.pos_embed = nn.Parameter(torch.zeros(1, height * width + 1, d_model))
         self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=d_model * 4,
-            dropout=0.0,
+            dropout=dropout,
             batch_first=True,
             norm_first=True,
         )
@@ -196,8 +348,11 @@ class BoardTransformerPolicy(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch = x.shape[0]
-        tokens = x.permute(0, 2, 3, 1).reshape(batch, self.height * self.width, -1)
-        tokens = self.token_proj(tokens)
+        if self.encoder_stem == "conv":
+            tokens = self.conv_stem(x).flatten(2).transpose(1, 2)
+        else:
+            tokens = x.permute(0, 2, 3, 1).reshape(batch, self.height * self.width, -1)
+            tokens = self.token_proj(tokens)
         cls = self.cls.expand(batch, -1, -1)
         tokens = torch.cat([cls, tokens], dim=1) + self.pos_embed
         encoded = self.encoder(tokens)
@@ -320,6 +475,251 @@ def solve_trajectories(
     return [trajectory for trajectory in trajectories if trajectory is not None]
 
 
+def project_relative_path(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(PROJECT_ROOT.resolve()).as_posix()
+    except ValueError:
+        return resolved.as_posix()
+
+
+def resolve_manifest_path(value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cache_dir_size_bytes(cache_dir: Path) -> int:
+    if not cache_dir.exists():
+        return 0
+    return sum(path.stat().st_size for path in cache_dir.rglob("*") if path.is_file())
+
+
+def cache_files(cache_dir: Path) -> tuple[Path, Path]:
+    return cache_dir / "manifest.json", cache_dir / "data.pt"
+
+
+def planner_imitation_cache_key(puzzle_paths: list[Path], height: int, width: int) -> str:
+    digest = hashlib.sha256()
+    digest.update(f"schema={CACHE_SCHEMA_VERSION};height={height};width={width}".encode("utf-8"))
+    for path in puzzle_paths:
+        digest.update(project_relative_path(path).encode("utf-8"))
+        digest.update(file_sha256(path).encode("ascii"))
+    return digest.hexdigest()[:16]
+
+
+def cache_exists(cache_dir: Path) -> bool:
+    manifest_path, data_path = cache_files(cache_dir)
+    return manifest_path.exists() and data_path.exists()
+
+
+def validate_cache_manifest(
+    manifest: dict[str, object],
+    puzzle_paths: list[Path],
+    height: int,
+    width: int,
+) -> None:
+    if int(manifest.get("schema_version", -1)) != CACHE_SCHEMA_VERSION:
+        raise ValueError(
+            f"Cache schema {manifest.get('schema_version')} does not match expected {CACHE_SCHEMA_VERSION}"
+        )
+    if int(manifest.get("height", -1)) != height or int(manifest.get("width", -1)) != width:
+        raise ValueError(
+            f"Cache board {manifest.get('height')}x{manifest.get('width')} does not match requested {height}x{width}"
+        )
+    cached_puzzles = manifest.get("puzzles")
+    if not isinstance(cached_puzzles, list):
+        raise ValueError("Cache manifest is missing a puzzle list")
+    if len(cached_puzzles) != len(puzzle_paths):
+        raise ValueError(f"Cache puzzle count {len(cached_puzzles)} does not match requested {len(puzzle_paths)}")
+    for idx, (cached, requested_path) in enumerate(zip(cached_puzzles, puzzle_paths, strict=True)):
+        if not isinstance(cached, dict):
+            raise ValueError(f"Cache puzzle entry {idx} is not an object")
+        requested_rel = project_relative_path(requested_path)
+        cached_rel = str(cached.get("path"))
+        if cached_rel != requested_rel:
+            raise ValueError(f"Cache puzzle {idx} path {cached_rel!r} does not match requested {requested_rel!r}")
+        requested_hash = file_sha256(requested_path)
+        cached_hash = str(cached.get("sha256"))
+        if cached_hash != requested_hash:
+            raise ValueError(f"Cache puzzle {requested_rel} content hash changed; rebuild the cache")
+
+
+def load_planner_imitation_cache(
+    cache_dir: Path,
+    puzzle_paths: list[Path],
+    height: int,
+    width: int,
+    transforms: tuple[str, ...],
+    transform_level0_only: bool,
+    transform_mode: str,
+    seed: int,
+) -> tuple[list[Trajectory], CachedExpertDataset, dict[str, object]]:
+    start = time.perf_counter()
+    manifest_path, data_path = cache_files(cache_dir)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    validate_cache_manifest(manifest, puzzle_paths, height, width)
+    payload = torch.load(data_path, map_location="cpu", weights_only=True)
+    cached_puzzles = manifest["puzzles"]
+    trajectories = [
+        Trajectory(
+            puzzle_path=resolve_manifest_path(str(item["path"])),
+            plan=str(item["plan"]),
+            solve_time_s=float(item.get("solve_time_s", 0.0)),
+        )
+        for item in cached_puzzles
+    ]
+    dataset = CachedExpertDataset(
+        states=payload["states"],
+        actions=payload["actions"],
+        remaining=payload["remaining"],
+        puzzle_heights=payload["puzzle_heights"],
+        puzzle_widths=payload["puzzle_widths"],
+        puzzle_indices=payload["puzzle_indices"],
+        puzzle_paths=[trajectory.puzzle_path for trajectory in trajectories],
+        height=height,
+        width=width,
+        transforms=transforms,
+        transform_level0_only=transform_level0_only,
+        transform_mode=transform_mode,
+        seed=seed,
+        profile={
+            "dataset_materialization_time_s": 0.0,
+            "puzzle_parse_time_s": 0.0,
+            "state_encode_time_s": 0.0,
+            "env_step_time_s": 0.0,
+        },
+    )
+    cache_profile = {
+        "hit": True,
+        "cache_dir": str(cache_dir),
+        "load_time_s": time.perf_counter() - start,
+        "build_time_s": 0.0,
+        "size_bytes": cache_dir_size_bytes(cache_dir),
+        "manifest_build_profile": manifest.get("build_profile", {}),
+    }
+    return trajectories, dataset, cache_profile
+
+
+def build_planner_imitation_cache(
+    cache_dir: Path,
+    trajectories: list[Trajectory],
+    height: int,
+    width: int,
+    transforms: tuple[str, ...],
+    transform_level0_only: bool,
+    transform_mode: str,
+    seed: int,
+) -> tuple[CachedExpertDataset, dict[str, object]]:
+    start = time.perf_counter()
+    states: list[torch.Tensor] = []
+    actions: list[int] = []
+    remaining_targets: list[int] = []
+    puzzle_heights: list[int] = []
+    puzzle_widths: list[int] = []
+    puzzle_indices: list[int] = []
+    profile: dict[str, float] = {
+        "dataset_materialization_time_s": 0.0,
+        "puzzle_parse_time_s": 0.0,
+        "state_encode_time_s": 0.0,
+        "env_step_time_s": 0.0,
+    }
+    materialize_start = time.perf_counter()
+    for puzzle_idx, trajectory in enumerate(tqdm(trajectories, desc="materialize cache", unit="puzzle")):
+        parse_start = time.perf_counter()
+        puzzle = PushWorldPuzzle(str(trajectory.puzzle_path))
+        profile["puzzle_parse_time_s"] += time.perf_counter() - parse_start
+        puzzle_width, puzzle_height = puzzle.dimensions
+        state = puzzle.initial_state
+        plan_length = len(trajectory.plan)
+        for step_idx, action_char in enumerate(trajectory.plan):
+            encode_start = time.perf_counter()
+            planes = encode_state(puzzle, state, height, width)
+            profile["state_encode_time_s"] += time.perf_counter() - encode_start
+            states.append(torch.from_numpy(planes.astype(np.uint8)))
+            action = Actions.FROM_CHAR[action_char]
+            actions.append(action)
+            remaining_targets.append(plan_length - step_idx)
+            puzzle_heights.append(puzzle_height)
+            puzzle_widths.append(puzzle_width)
+            puzzle_indices.append(puzzle_idx)
+            step_start = time.perf_counter()
+            state = puzzle.get_next_state(state, action)
+            profile["env_step_time_s"] += time.perf_counter() - step_start
+        if not puzzle.is_goal_state(state):
+            raise ValueError(f"Planner trace does not solve {trajectory.puzzle_path}")
+    profile["dataset_materialization_time_s"] = time.perf_counter() - materialize_start
+
+    payload = {
+        "states": torch.stack(states) if states else torch.zeros((0, 7, height, width), dtype=torch.uint8),
+        "actions": torch.tensor(actions, dtype=torch.long),
+        "remaining": torch.tensor(remaining_targets, dtype=torch.long),
+        "puzzle_heights": torch.tensor(puzzle_heights, dtype=torch.int16),
+        "puzzle_widths": torch.tensor(puzzle_widths, dtype=torch.int16),
+        "puzzle_indices": torch.tensor(puzzle_indices, dtype=torch.long),
+    }
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path, data_path = cache_files(cache_dir)
+    torch.save(payload, data_path)
+    manifest: dict[str, object] = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "height": height,
+        "width": width,
+        "channels": 7,
+        "examples": len(actions),
+        "puzzles": [
+            {
+                "path": project_relative_path(trajectory.puzzle_path),
+                "sha256": file_sha256(trajectory.puzzle_path),
+                "plan": trajectory.plan,
+                "plan_length": len(trajectory.plan),
+                "solve_time_s": trajectory.solve_time_s,
+            }
+            for trajectory in trajectories
+        ],
+        "build_profile": profile,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    size_bytes = cache_dir_size_bytes(cache_dir)
+    manifest["size_bytes"] = size_bytes
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    dataset = CachedExpertDataset(
+        states=payload["states"],
+        actions=payload["actions"],
+        remaining=payload["remaining"],
+        puzzle_heights=payload["puzzle_heights"],
+        puzzle_widths=payload["puzzle_widths"],
+        puzzle_indices=payload["puzzle_indices"],
+        puzzle_paths=[trajectory.puzzle_path for trajectory in trajectories],
+        height=height,
+        width=width,
+        transforms=transforms,
+        transform_level0_only=transform_level0_only,
+        transform_mode=transform_mode,
+        seed=seed,
+        profile=profile,
+    )
+    cache_profile = {
+        "hit": False,
+        "cache_dir": str(cache_dir),
+        "load_time_s": 0.0,
+        "build_time_s": time.perf_counter() - start,
+        "size_bytes": size_bytes,
+        "manifest_build_profile": profile,
+    }
+    return dataset, cache_profile
+
+
 def train(
     model: nn.Module,
     dataset: ExpertDataset,
@@ -337,6 +737,11 @@ def train(
     top_k: int,
     max_cache_entries: int,
     repeat_penalty: float,
+    distance_target: str,
+    beam_score: str,
+    distance_weight: float,
+    beam_length_normalization: float,
+    closed_list_pruning: bool,
     quick_eval_every: int,
     log_every_batches: int,
     amp: bool,
@@ -351,6 +756,7 @@ def train(
         None,
     ]
     | None = None,
+    profile: dict[str, float | int] | None = None,
 ) -> list[float]:
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -361,6 +767,12 @@ def train(
         optimizer.load_state_dict(optimizer_state_dict)
     if scaler_state_dict is not None:
         scaler.load_state_dict(scaler_state_dict)
+    if profile is not None:
+        profile.setdefault("dataloader_wait_time_s", 0.0)
+        profile.setdefault("forward_backward_update_time_s", 0.0)
+        profile.setdefault("optimizer_steps", 0)
+        profile.setdefault("examples", 0)
+        profile.setdefault("epochs", 0)
     losses = []
     global_step = initial_global_step
     model.train()
@@ -373,31 +785,55 @@ def train(
             current_epoch = epoch
             total_loss = 0.0
             total_count = 0
-            batch_progress = tqdm(loader, desc=f"epoch {current_epoch}/{epochs}", unit="batch", leave=False)
-            for states, actions, remaining in batch_progress:
-                global_step += 1
-                states = states.to(device)
-                actions = actions.to(device)
-                remaining = remaining.to(device).clamp_max(model.distance_head.out_features - 1)
-                with torch.amp.autocast("cuda", enabled=amp and device.type == "cuda"):
-                    action_logits, distance_logits = model(states)
-                    action_loss = nn.functional.cross_entropy(action_logits, actions)
-                    distance_loss = nn.functional.cross_entropy(distance_logits, remaining)
-                    loss = action_loss + distance_loss_weight * distance_loss
-                optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                total_loss += float(loss.detach().cpu()) * states.shape[0]
-                total_count += states.shape[0]
-                batch_loss = float(loss.detach().cpu())
-                batch_progress.set_postfix(loss=f"{batch_loss:.4f}")
-                if writer is not None and log_every_batches > 0 and global_step % log_every_batches == 0:
-                    writer.add_scalar("train/batch_loss", batch_loss, global_step)
-                    writer.add_scalar("train/action_loss", float(action_loss.detach().cpu()), global_step)
-                    writer.add_scalar("train/distance_loss", float(distance_loss.detach().cpu()), global_step)
+            loader_iter = iter(loader)
+            with tqdm(total=len(loader), desc=f"epoch {current_epoch}/{epochs}", unit="batch", leave=False) as batch_progress:
+                while True:
+                    wait_start = time.perf_counter()
+                    try:
+                        states, actions, remaining = next(loader_iter)
+                    except StopIteration:
+                        break
+                    if profile is not None:
+                        profile["dataloader_wait_time_s"] = float(profile["dataloader_wait_time_s"]) + (
+                            time.perf_counter() - wait_start
+                        )
+                    global_step += 1
+                    step_start = time.perf_counter()
+                    states = states.to(device)
+                    actions = actions.to(device)
+                    remaining = distance_targets(
+                        remaining.to(device),
+                        model.distance_head.out_features,
+                        distance_target,
+                    )
+                    with torch.amp.autocast("cuda", enabled=amp and device.type == "cuda"):
+                        action_logits, distance_logits = model(states)
+                        action_loss = nn.functional.cross_entropy(action_logits, actions)
+                        distance_loss = nn.functional.cross_entropy(distance_logits, remaining)
+                        loss = action_loss + distance_loss_weight * distance_loss
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    if profile is not None:
+                        profile["forward_backward_update_time_s"] = float(
+                            profile["forward_backward_update_time_s"]
+                        ) + (time.perf_counter() - step_start)
+                        profile["optimizer_steps"] = int(profile["optimizer_steps"]) + 1
+                        profile["examples"] = int(profile["examples"]) + int(states.shape[0])
+                    total_loss += float(loss.detach().cpu()) * states.shape[0]
+                    total_count += states.shape[0]
+                    batch_loss = float(loss.detach().cpu())
+                    batch_progress.set_postfix(loss=f"{batch_loss:.4f}")
+                    batch_progress.update(1)
+                    if writer is not None and log_every_batches > 0 and global_step % log_every_batches == 0:
+                        writer.add_scalar("train/batch_loss", batch_loss, global_step)
+                        writer.add_scalar("train/action_loss", float(action_loss.detach().cpu()), global_step)
+                        writer.add_scalar("train/distance_loss", float(distance_loss.detach().cpu()), global_step)
             epoch_loss = total_loss / max(1, total_count)
             losses.append(epoch_loss)
+            if profile is not None:
+                profile["epochs"] = int(profile["epochs"]) + 1
             if writer is not None:
                 writer.add_scalar("train/loss", epoch_loss, current_epoch)
                 writer.add_scalar("train/global_step", global_step, current_epoch)
@@ -417,6 +853,12 @@ def train(
                     f"quick epoch {current_epoch}",
                     max_cache_entries,
                     repeat_penalty,
+                    distance_target,
+                    max_steps,
+                    beam_score,
+                    distance_weight,
+                    beam_length_normalization,
+                    closed_list_pruning=closed_list_pruning,
                     leave=False,
                 )
                 success_rate = quick_eval["solved"] / max(1, quick_eval["total"])
@@ -440,14 +882,16 @@ def make_tensorboard_writer(log_dir: Path | None) -> object | None:
     if log_dir is None:
         return None
     try:
-        from torch.utils.tensorboard import SummaryWriter
+        with open(os.devnull, "w", encoding="utf-8") as devnull, contextlib.redirect_stderr(devnull):
+            from torch.utils.tensorboard import SummaryWriter
     except ImportError as exc:
         raise RuntimeError(
             "TensorBoard logging requested, but tensorboard is not installed. "
             "Install it with: uv pip install tensorboard"
         ) from exc
     log_dir.mkdir(parents=True, exist_ok=True)
-    return SummaryWriter(log_dir=str(log_dir))
+    with open(os.devnull, "w", encoding="utf-8") as devnull, contextlib.redirect_stderr(devnull):
+        return SummaryWriter(log_dir=str(log_dir))
 
 
 def evaluate(
@@ -463,17 +907,27 @@ def evaluate(
     label: str,
     max_cache_entries: int,
     repeat_penalty: float = 0.0,
+    distance_target: str = "linear",
+    distance_max_steps: int | None = None,
+    beam_score: str = "policy_distance",
+    distance_weight: float = 0.15,
+    beam_length_normalization: float = 0.0,
+    closed_list_pruning: bool = False,
     leave: bool = True,
 ) -> dict[str, object]:
     model.eval()
     solved = 0
     results = []
     encode_cache: dict[tuple[str, tuple[tuple[int, int], ...]], torch.Tensor] = {}
+    prediction_cache: dict[tuple[str, tuple[tuple[int, int], ...]], tuple[torch.Tensor, torch.Tensor]] = {}
+    profile = RolloutProfile()
     start = time.perf_counter()
     with torch.inference_mode():
         progress = tqdm(puzzle_paths, desc=f"eval {label}", unit="puzzle", leave=leave)
         for path in progress:
+            parse_start = time.perf_counter()
             puzzle = PushWorldPuzzle(str(path))
+            profile.puzzle_parse_time_s += time.perf_counter() - parse_start
             state = puzzle.initial_state
             actions: list[str] = []
             repeated_states = 0
@@ -496,9 +950,19 @@ def evaluate(
                     max_cache_entries=max_cache_entries,
                     seen_states=seen,
                     repeat_penalty=repeat_penalty,
+                    distance_target=distance_target,
+                    distance_max_steps=distance_max_steps,
+                    beam_score=beam_score,
+                    distance_weight=distance_weight,
+                    beam_length_normalization=beam_length_normalization,
+                    prediction_cache=prediction_cache,
+                    profile=profile,
+                    closed_list_pruning=closed_list_pruning,
                 )
                 actions.append(ACTION_CHARS[action])
+                step_start = time.perf_counter()
                 state = puzzle.get_next_state(state, action)
+                profile.env_step_time_s += time.perf_counter() - step_start
                 if state in seen:
                     repeated_states += 1
                 seen.add(state)
@@ -520,12 +984,128 @@ def evaluate(
                 solved=f"{solved}/{len(results)}",
                 eta_s=f"{remaining:.0f}",
             )
+    elapsed = time.perf_counter() - start
+    profile.eval_loop_time_s = elapsed
     return {
         "solved": solved,
         "total": len(puzzle_paths),
-        "time_s": time.perf_counter() - start,
+        "time_s": elapsed,
+        "solves_per_minute": solved * 60.0 / max(elapsed, 1e-9),
         "cache_entries": len(encode_cache),
+        "prediction_cache_entries": len(prediction_cache),
         "repeat_penalty": repeat_penalty,
+        "distance_target": distance_target,
+        "beam_score": beam_score,
+        "distance_weight": distance_weight,
+        "beam_length_normalization": beam_length_normalization,
+        "closed_list_pruning": closed_list_pruning,
+        "profile": profile.to_dict(),
+        "results": results,
+    }
+
+
+def evaluate_best_first(
+    model: nn.Module,
+    puzzle_paths: list[Path],
+    height: int,
+    width: int,
+    device: torch.device,
+    max_steps: int,
+    top_k: int,
+    label: str,
+    max_cache_entries: int,
+    distance_target: str,
+    distance_max_steps: int,
+    distance_weight: float,
+    node_budget: int,
+    batch_size: int,
+    leave: bool = True,
+) -> dict[str, object]:
+    model.eval()
+    solved = 0
+    results = []
+    encode_cache: dict[tuple[str, tuple[tuple[int, int], ...]], torch.Tensor] = {}
+    prediction_cache: dict[tuple[str, tuple[tuple[int, int], ...]], tuple[torch.Tensor, torch.Tensor]] = {}
+    profile = RolloutProfile()
+    start = time.perf_counter()
+    with torch.inference_mode():
+        progress = tqdm(puzzle_paths, desc=f"eval {label}", unit="puzzle", leave=leave)
+        for path in progress:
+            parse_start = time.perf_counter()
+            puzzle = PushWorldPuzzle(str(path))
+            profile.puzzle_parse_time_s += time.perf_counter() - parse_start
+            if puzzle.dimensions[1] > height or puzzle.dimensions[0] > width:
+                result = {
+                    "puzzle": path.name,
+                    "solved": False,
+                    "steps": 0,
+                    "actions": "",
+                    "skipped": True,
+                    "reason": (
+                        f"puzzle dimensions {puzzle.dimensions} exceed checkpoint "
+                        f"padding width={width}, height={height}"
+                    ),
+                }
+                results.append(result)
+                progress.set_postfix(solved=f"{solved}/{len(results)}")
+                continue
+
+            search = best_first_search(
+                model=model,
+                puzzle=puzzle,
+                state=puzzle.initial_state,
+                height=height,
+                width=width,
+                device=device,
+                puzzle_key=str(path),
+                encode_cache=encode_cache,
+                max_cache_entries=max_cache_entries,
+                node_budget=node_budget,
+                batch_size=batch_size,
+                top_k=top_k,
+                max_depth=max_steps,
+                distance_target=distance_target,
+                distance_max_steps=distance_max_steps,
+                distance_weight=distance_weight,
+                prediction_cache=prediction_cache,
+                profile=profile,
+            )
+            actions = "".join(ACTION_CHARS[action] for action in search.path[:max_steps])
+            did_solve = search.solved
+            solved += int(did_solve)
+            elapsed = max(time.perf_counter() - start, 1e-9)
+            results.append(
+                {
+                    "puzzle": path.name,
+                    "solved": did_solve,
+                    "steps": len(search.path),
+                    "actions": actions,
+                    "nodes_expanded": search.expanded,
+                    "nodes_generated": search.generated,
+                    "closed_size": search.closed,
+                    "frontier_size": search.frontier,
+                }
+            )
+            rate = len(results) / elapsed
+            remaining = (len(puzzle_paths) - len(results)) / rate if rate > 0 else 0.0
+            progress.set_postfix(solved=f"{solved}/{len(results)}", eta_s=f"{remaining:.0f}")
+    elapsed = time.perf_counter() - start
+    profile.eval_loop_time_s = elapsed
+    return {
+        "solved": solved,
+        "total": len(puzzle_paths),
+        "success_rate": solved / max(1, len(puzzle_paths)),
+        "time_s": elapsed,
+        "solves_per_minute": solved * 60.0 / max(elapsed, 1e-9),
+        "max_steps": max_steps,
+        "top_k": top_k,
+        "node_budget": node_budget,
+        "batch_size": batch_size,
+        "distance_target": distance_target,
+        "distance_weight": distance_weight,
+        "cache_entries": len(encode_cache),
+        "prediction_cache_entries": len(prediction_cache),
+        "profile": profile.to_dict(),
         "results": results,
     }
 
@@ -554,7 +1134,7 @@ def main() -> None:
     parser.add_argument(
         "--planner",
         type=Path,
-        default=PROJECT_ROOT / "external/pushworld/cpp/build/bin/run_planner",
+        default=default_planner_path(),
     )
     parser.add_argument("--train-puzzles", type=int, default=5, help="Number of train puzzles to use unless --all-train is set.")
     parser.add_argument("--test-puzzles", type=int, default=10, help="Number of held-out Level 0 puzzles to evaluate unless --all-test is set.")
@@ -575,10 +1155,39 @@ def main() -> None:
             + ",".join(SYMMETRY_TRANSFORMS)
         ),
     )
+    parser.add_argument(
+        "--level0-augment-mode",
+        choices=("random", "exhaustive"),
+        default="random",
+        help=(
+            "For Level-0 symmetry augmentation, 'random' samples one transform per "
+            "example access; 'exhaustive' includes every selected transform as a "
+            "separate training item each epoch."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--distance-loss-weight", type=float, default=0.2)
+    parser.add_argument(
+        "--distance-target",
+        choices=DISTANCE_TARGETS,
+        default="log",
+        help="Remaining-step target encoding for the auxiliary value head.",
+    )
+    parser.add_argument(
+        "--distance-bins",
+        type=int,
+        default=0,
+        help="Value-head bins. 0 picks max_steps+1 for linear or a compact log scale for log targets.",
+    )
+    parser.add_argument(
+        "--encoder-stem",
+        choices=["linear", "conv"],
+        default="conv",
+        help="Use a linear per-cell projection or a local convolutional board encoder before the transformer.",
+    )
+    parser.add_argument("--dropout", type=float, default=0.01, help="Transformer dropout probability.")
     parser.add_argument("--d-model", type=int, default=96)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--layers", type=int, default=2)
@@ -593,10 +1202,67 @@ def main() -> None:
         default=0.0,
         help="Add this beam cost when a rollout candidate revisits a state already seen in the current rollout.",
     )
+    parser.add_argument(
+        "--beam-score",
+        choices=BEAM_SCORE_MODES,
+        default="policy_distance",
+        help="Beam ranking objective: policy cost, value distance, or the weighted combination.",
+    )
+    parser.add_argument(
+        "--distance-weight",
+        type=float,
+        default=0.15,
+        help="Weight for the auxiliary distance estimate in policy_distance beam scoring.",
+    )
+    parser.add_argument(
+        "--beam-length-normalization",
+        type=float,
+        default=0.0,
+        help="Divide cumulative policy cost by path_length^N before beam ranking; 0 preserves old scoring.",
+    )
+    parser.add_argument(
+        "--closed-list-pruning",
+        action="store_true",
+        help="Drop beam candidates that revisit states already seen in the current rollout.",
+    )
     parser.add_argument("--eval-every", type=int, default=0, help="Run quick held-out Level 0 eval every N epochs; 0 disables it.")
     parser.add_argument("--eval-puzzles", type=int, default=50, help="Number of held-out Level 0 puzzles for periodic quick eval.")
+    parser.add_argument(
+        "--level1-bf-eval-every",
+        type=int,
+        default=0,
+        help="Run Level-1 best-first eval every N epochs; 0 disables periodic Level-1 BF eval.",
+    )
+    parser.add_argument(
+        "--level1-bf-eval-puzzles",
+        type=int,
+        default=68,
+        help="Number of Level-1 puzzles for periodic BF eval unless --level1-bf-eval-all is set.",
+    )
+    parser.add_argument("--level1-bf-eval-all", action="store_true", help="Use all selected Level-1 puzzles for periodic BF eval.")
+    parser.add_argument("--level1-bf-max-steps", type=int, default=200)
+    parser.add_argument("--level1-bf-budget", type=int, default=1024)
+    parser.add_argument("--level1-bf-batch-size", type=int, default=32)
+    parser.add_argument("--level1-bf-top-k", type=int, default=3)
+    parser.add_argument(
+        "--level1-bf-eval-output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for per-epoch Level-1 BF eval JSON files.",
+    )
     parser.add_argument("--log-every-batches", type=int, default=10, help="Log batch losses to TensorBoard every N optimizer steps; 0 disables batch logging.")
     parser.add_argument("--max-cache-entries", type=int, default=250_000)
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Persistent planner-imitation tensor cache directory. Existing valid caches skip RGD and base-state encoding.",
+    )
+    parser.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Rebuild --cache-dir even if manifest.json and data.pt already exist.",
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--model-output", type=Path, default=None)
     parser.add_argument(
@@ -621,6 +1287,11 @@ def main() -> None:
     )
     parser.add_argument("--tensorboard-log", type=Path, default=None)
     parser.add_argument("--skip-train-eval", action="store_true")
+    parser.add_argument(
+        "--skip-final-eval",
+        action="store_true",
+        help="Skip train/test/Level-1 rollout evaluation after training and save the checkpoint immediately.",
+    )
     parser.add_argument("--print-expert-plans", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--planner-time-limit", type=float, default=10.0)
@@ -633,6 +1304,28 @@ def main() -> None:
         raise ValueError("--planner-workers must be >= 1")
     if args.repeat_penalty < 0.0:
         raise ValueError("--repeat-penalty must be >= 0")
+    if args.distance_bins < 0:
+        raise ValueError("--distance-bins must be >= 0")
+    if args.distance_weight < 0.0:
+        raise ValueError("--distance-weight must be >= 0")
+    if args.beam_length_normalization < 0.0:
+        raise ValueError("--beam-length-normalization must be >= 0")
+    if not 0.0 <= args.dropout < 1.0:
+        raise ValueError("--dropout must be in [0, 1)")
+    if args.rebuild_cache and args.cache_dir is None:
+        raise ValueError("--rebuild-cache requires --cache-dir")
+    if args.level1_bf_eval_every < 0:
+        raise ValueError("--level1-bf-eval-every must be >= 0")
+    if args.level1_bf_eval_puzzles < 1:
+        raise ValueError("--level1-bf-eval-puzzles must be >= 1")
+    if args.level1_bf_max_steps < 1:
+        raise ValueError("--level1-bf-max-steps must be >= 1")
+    if args.level1_bf_budget < 1:
+        raise ValueError("--level1-bf-budget must be >= 1")
+    if args.level1_bf_batch_size < 1:
+        raise ValueError("--level1-bf-batch-size must be >= 1")
+    if args.level1_bf_top_k < 1:
+        raise ValueError("--level1-bf-top-k must be >= 1")
 
     if args.augment_transforms == "all":
         train_transforms = SYMMETRY_TRANSFORMS if args.level0_symmetry_augment else ("r0",)
@@ -675,13 +1368,88 @@ def main() -> None:
         f"board={height}x{width} planner={args.planner} "
         f"planner_workers={args.planner_workers} repeat_penalty={args.repeat_penalty}"
     )
+    distance_bins = args.distance_bins or auto_distance_bins(args.max_steps, args.distance_target)
+    print(
+        f"model encoder_stem={args.encoder_stem} dropout={args.dropout} "
+        f"distance_target={args.distance_target} distance_bins={distance_bins} "
+        f"beam_score={args.beam_score} distance_weight={args.distance_weight} "
+        f"beam_length_normalization={args.beam_length_normalization}"
+    )
     writer = make_tensorboard_writer(args.tensorboard_log)
     if writer is not None:
         writer.add_text("config/args", json.dumps({k: str(v) for k, v in vars(args).items()}, indent=2))
 
-    solve_start = time.perf_counter()
-    trajectories = solve_trajectories(args.planner, train_paths, args.planner_time_limit, args.planner_workers)
-    solve_time = time.perf_counter() - solve_start
+    cache_profile: dict[str, object] = {
+        "enabled": args.cache_dir is not None,
+        "hit": False,
+        "cache_dir": str(args.cache_dir) if args.cache_dir is not None else None,
+        "load_time_s": 0.0,
+        "build_time_s": 0.0,
+        "size_bytes": 0,
+    }
+    solve_time = 0.0
+    if args.cache_dir is not None and cache_exists(args.cache_dir) and not args.rebuild_cache:
+        trajectories, dataset, loaded_cache_profile = load_planner_imitation_cache(
+            cache_dir=args.cache_dir,
+            puzzle_paths=train_paths,
+            height=height,
+            width=width,
+            transforms=train_transforms,
+            transform_level0_only=args.level0_symmetry_augment,
+            transform_mode=args.level0_augment_mode,
+            seed=args.seed,
+        )
+        cache_profile.update(loaded_cache_profile)
+        print(
+            "cache_summary="
+            + json.dumps(
+                {
+                    "hit": True,
+                    "cache_dir": str(args.cache_dir),
+                    "load_time_s": round(float(cache_profile["load_time_s"]), 3),
+                    "size_mb": round(float(cache_profile["size_bytes"]) / 1024 / 1024, 2),
+                },
+                indent=2,
+            )
+        )
+    else:
+        solve_start = time.perf_counter()
+        trajectories = solve_trajectories(args.planner, train_paths, args.planner_time_limit, args.planner_workers)
+        solve_time = time.perf_counter() - solve_start
+        if args.cache_dir is not None:
+            dataset, built_cache_profile = build_planner_imitation_cache(
+                cache_dir=args.cache_dir,
+                trajectories=trajectories,
+                height=height,
+                width=width,
+                transforms=train_transforms,
+                transform_level0_only=args.level0_symmetry_augment,
+                transform_mode=args.level0_augment_mode,
+                seed=args.seed,
+            )
+            cache_profile.update(built_cache_profile)
+            print(
+                "cache_summary="
+                + json.dumps(
+                    {
+                        "hit": False,
+                        "cache_dir": str(args.cache_dir),
+                        "build_time_s": round(float(cache_profile["build_time_s"]), 3),
+                        "size_mb": round(float(cache_profile["size_bytes"]) / 1024 / 1024, 2),
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            dataset = ExpertDataset(
+                trajectories,
+                height=height,
+                width=width,
+                transforms=train_transforms,
+                transform_level0_only=args.level0_symmetry_augment,
+                transform_mode=args.level0_augment_mode,
+                seed=args.seed,
+            )
     expert_plan_summary = [
         {"puzzle": t.puzzle_path.name, "plan": t.plan, "solve_time_s": round(t.solve_time_s, 4)}
         for t in trajectories
@@ -704,14 +1472,7 @@ def main() -> None:
             )
         )
 
-    dataset = ExpertDataset(
-        trajectories,
-        height=height,
-        width=width,
-        transforms=train_transforms,
-        transform_level0_only=args.level0_symmetry_augment,
-        seed=args.seed,
-    )
+    dataset_profile = dict(getattr(dataset, "profile", {}))
     print(
         "dataset_summary="
         + json.dumps(
@@ -722,6 +1483,8 @@ def main() -> None:
                 "level0_augmented_base_examples": dataset.augmented_base_examples,
                 "unaugmented_base_examples": dataset.unaugmented_base_examples,
                 "transforms": list(train_transforms),
+                "level0_augment_mode": args.level0_augment_mode,
+                "profile": dataset_profile,
             },
             indent=2,
         )
@@ -734,6 +1497,8 @@ def main() -> None:
         writer.add_scalar("data/examples", len(dataset), 0)
         writer.add_scalar("data/augmentation_factor", len(dataset) / max(1, dataset.base_examples), 0)
         writer.add_scalar("time/expert_solve_s", solve_time, 0)
+        writer.add_scalar("time/cache_load_s", float(cache_profile["load_time_s"]), 0)
+        writer.add_scalar("time/cache_build_s", float(cache_profile["build_time_s"]), 0)
     model = BoardTransformerPolicy(
         channels=7,
         height=height,
@@ -741,7 +1506,9 @@ def main() -> None:
         d_model=args.d_model,
         nhead=args.nhead,
         layers=args.layers,
-        distance_bins=args.max_steps + 1,
+        distance_bins=distance_bins,
+        encoder_stem=args.encoder_stem,
+        dropout=args.dropout,
     ).to(device)
     resume_epoch = 0
     resume_global_step = 0
@@ -770,6 +1537,12 @@ def main() -> None:
         if resume_epoch >= args.epochs:
             print(f"resume epoch {resume_epoch} is >= requested --epochs {args.epochs}; no training batches will run")
     quick_eval_paths = test_paths[: args.eval_puzzles] if args.eval_every > 0 else []
+    level1_bf_eval_paths = (
+        level1_paths if args.level1_bf_eval_all else level1_paths[: args.level1_bf_eval_puzzles]
+    )
+    if args.level1_bf_eval_every <= 0:
+        level1_bf_eval_paths = []
+    epoch_level1_bf_evals: list[dict[str, object]] = []
 
     epoch_checkpoint_dir = args.epoch_checkpoint_dir
     if epoch_checkpoint_dir is None and args.model_output is not None and not args.no_epoch_checkpoints:
@@ -814,16 +1587,63 @@ def main() -> None:
         global_step: int,
         tag: str | None,
     ) -> None:
-        del _model
-        if epoch_checkpoint_dir is None or args.no_epoch_checkpoints:
-            return
-        filename = f"{tag}_epoch_{epoch:03d}.pt" if tag else f"epoch_{epoch:03d}.pt"
-        path = epoch_checkpoint_dir / filename
-        save_checkpoint(path, epoch, epoch_loss, optimizer, scaler, global_step, interrupted=tag == "interrupted")
-        if writer is not None:
-            writer.add_text("checkpoint/latest_epoch", str(path), epoch)
-        print(f"wrote {path}")
+        if epoch_checkpoint_dir is not None and not args.no_epoch_checkpoints:
+            filename = f"{tag}_epoch_{epoch:03d}.pt" if tag else f"epoch_{epoch:03d}.pt"
+            path = epoch_checkpoint_dir / filename
+            save_checkpoint(path, epoch, epoch_loss, optimizer, scaler, global_step, interrupted=tag == "interrupted")
+            if writer is not None:
+                writer.add_text("checkpoint/latest_epoch", str(path), epoch)
+            print(f"wrote {path}")
+        if level1_bf_eval_paths and args.level1_bf_eval_every > 0 and epoch % args.level1_bf_eval_every == 0:
+            eval_result = evaluate_best_first(
+                _model,
+                level1_bf_eval_paths,
+                height,
+                width,
+                device,
+                args.level1_bf_max_steps,
+                args.level1_bf_top_k,
+                f"level1 bf epoch {epoch}",
+                args.max_cache_entries,
+                args.distance_target,
+                args.max_steps,
+                args.distance_weight,
+                args.level1_bf_budget,
+                args.level1_bf_batch_size,
+                leave=False,
+            )
+            compact = {
+                "epoch": epoch,
+                "solved": eval_result["solved"],
+                "total": eval_result["total"],
+                "success_rate": eval_result["success_rate"],
+                "time_s": eval_result["time_s"],
+                "solves_per_minute": eval_result["solves_per_minute"],
+                "max_steps": eval_result["max_steps"],
+                "node_budget": eval_result["node_budget"],
+                "batch_size": eval_result["batch_size"],
+                "top_k": eval_result["top_k"],
+                "solved_puzzles": [
+                    result["puzzle"]
+                    for result in eval_result["results"]
+                    if result["solved"]
+                ],
+            }
+            epoch_level1_bf_evals.append(compact)
+            print("level1_bf_epoch_eval=" + json.dumps(compact, indent=2))
+            if args.level1_bf_eval_output_dir is not None:
+                args.level1_bf_eval_output_dir.mkdir(parents=True, exist_ok=True)
+                out_path = args.level1_bf_eval_output_dir / f"epoch_{epoch:03d}.json"
+                out_path.write_text(json.dumps(eval_result, indent=2) + "\n", encoding="utf-8")
+                print(f"wrote {out_path}")
+            if writer is not None:
+                writer.add_scalar("eval_level1_bf/solved", int(eval_result["solved"]), epoch)
+                writer.add_scalar("eval_level1_bf/total", int(eval_result["total"]), epoch)
+                writer.add_scalar("eval_level1_bf/success_rate", float(eval_result["success_rate"]), epoch)
+                writer.add_scalar("eval_level1_bf/time_s", float(eval_result["time_s"]), epoch)
+            _model.train()
 
+    train_profile: dict[str, float | int] = {}
     train_start = time.perf_counter()
     interrupted = False
     try:
@@ -844,6 +1664,11 @@ def main() -> None:
             args.top_k,
             args.max_cache_entries,
             args.repeat_penalty,
+            args.distance_target,
+            args.beam_score,
+            args.distance_weight,
+            args.beam_length_normalization,
+            args.closed_list_pruning,
             args.eval_every,
             args.log_every_batches,
             args.amp,
@@ -854,11 +1679,13 @@ def main() -> None:
             resume_scaler_state,
             writer,
             save_epoch_checkpoint,
+            train_profile,
         )
     except TrainingInterrupted as exc:
         losses = exc.losses
         interrupted = True
     train_time = time.perf_counter() - train_start
+    train_profile["total_time_s"] = train_time
 
     if interrupted:
         print("training interrupted; saved interrupt checkpoint and skipped final evaluation")
@@ -868,12 +1695,37 @@ def main() -> None:
             writer.close()
         return
 
-    if args.skip_train_eval:
+    if args.skip_final_eval:
         train_eval = {"skipped": True, "solved": None, "total": len(train_paths)}
+        test_eval = {"skipped": True, "solved": None, "total": len(test_paths)}
+        level1_eval = {"skipped": True, "solved": None, "total": len(level1_paths)}
     else:
-        train_eval = evaluate(
+        if args.skip_train_eval:
+            train_eval = {"skipped": True, "solved": None, "total": len(train_paths)}
+        else:
+            train_eval = evaluate(
+                model,
+                train_paths,
+                height,
+                width,
+                device,
+                args.max_steps,
+                args.beam_width,
+                args.beam_depth,
+                args.top_k,
+                "train",
+                args.max_cache_entries,
+                args.repeat_penalty,
+                args.distance_target,
+                args.max_steps,
+                args.beam_score,
+                args.distance_weight,
+                args.beam_length_normalization,
+                closed_list_pruning=args.closed_list_pruning,
+            )
+        test_eval = evaluate(
             model,
-            train_paths,
+            test_paths,
             height,
             width,
             device,
@@ -881,38 +1733,36 @@ def main() -> None:
             args.beam_width,
             args.beam_depth,
             args.top_k,
-            "train",
+            "level0 test",
             args.max_cache_entries,
             args.repeat_penalty,
+            args.distance_target,
+            args.max_steps,
+            args.beam_score,
+            args.distance_weight,
+            args.beam_length_normalization,
+            closed_list_pruning=args.closed_list_pruning,
         )
-    test_eval = evaluate(
-        model,
-        test_paths,
-        height,
-        width,
-        device,
-        args.max_steps,
-        args.beam_width,
-        args.beam_depth,
-        args.top_k,
-        "level0 test",
-        args.max_cache_entries,
-        args.repeat_penalty,
-    )
-    level1_eval = evaluate(
-        model,
-        level1_paths,
-        height,
-        width,
-        device,
-        args.max_steps,
-        args.beam_width,
-        args.beam_depth,
-        args.top_k,
-        "level1",
-        args.max_cache_entries,
-        args.repeat_penalty,
-    )
+        level1_eval = evaluate(
+            model,
+            level1_paths,
+            height,
+            width,
+            device,
+            args.max_steps,
+            args.beam_width,
+            args.beam_depth,
+            args.top_k,
+            "level1",
+            args.max_cache_entries,
+            args.repeat_penalty,
+            args.distance_target,
+            args.max_steps,
+            args.beam_score,
+            args.distance_weight,
+            args.beam_length_normalization,
+            closed_list_pruning=args.closed_list_pruning,
+        )
 
     def compact_eval(payload: dict[str, object]) -> dict[str, object]:
         if payload.get("skipped"):
@@ -922,6 +1772,12 @@ def main() -> None:
         return {
             "solved": payload["solved"],
             "total": payload["total"],
+            "success_rate": payload["solved"] / max(1, payload["total"]),
+            "time_s": payload.get("time_s"),
+            "solves_per_minute": payload.get("solves_per_minute"),
+            "cache_entries": payload.get("cache_entries"),
+            "prediction_cache_entries": payload.get("prediction_cache_entries"),
+            "profile": payload.get("profile"),
             "solved_puzzles": [
                 result["puzzle"]
                 for result in payload["results"]
@@ -936,6 +1792,7 @@ def main() -> None:
         "level0_augmented_base_examples": dataset.augmented_base_examples,
         "unaugmented_base_examples": dataset.unaugmented_base_examples,
         "transforms": list(train_transforms),
+        "level0_augment_mode": args.level0_augment_mode,
         "solve_time_s": round(solve_time, 3),
         "train_time_s": round(train_time, 3),
         "final_loss": round(losses[-1], 6) if losses else None,
@@ -945,31 +1802,52 @@ def main() -> None:
         "d_model": args.d_model,
         "nhead": args.nhead,
         "layers": args.layers,
+        "encoder_stem": args.encoder_stem,
+        "dropout": args.dropout,
+        "distance_target": args.distance_target,
+        "distance_bins": distance_bins,
         "amp": args.amp,
         "seed": args.seed,
         "planner_workers": args.planner_workers,
         "repeat_penalty": args.repeat_penalty,
+        "beam_score": args.beam_score,
+        "distance_weight": args.distance_weight,
+        "beam_length_normalization": args.beam_length_normalization,
+        "closed_list_pruning": args.closed_list_pruning,
         "max_cache_entries": args.max_cache_entries,
+        "profile": {
+            "schema_version": 1,
+            "cache": cache_profile,
+            "data": {
+                "rgd_solve_time_s": solve_time,
+                **dataset_profile,
+            },
+            "train": train_profile,
+        },
+        "epoch_level1_bf_evals": epoch_level1_bf_evals,
         "train_eval": compact_eval(train_eval),
         "level0_test_eval": compact_eval(test_eval),
         "level1_eval": compact_eval(level1_eval),
     }
     if writer is not None:
+        train_solved = train_eval["solved"] or 0
+        test_solved = test_eval["solved"] or 0
+        level1_solved = level1_eval["solved"] or 0
         writer.add_scalar("time/train_s", train_time, 0)
-        writer.add_scalar("eval/train_solved", train_eval["solved"] or 0, 0)
+        writer.add_scalar("eval/train_solved", train_solved, 0)
         writer.add_scalar("eval/train_total", train_eval["total"], 0)
-        writer.add_scalar("eval/level0_test_solved", test_eval["solved"], 0)
+        writer.add_scalar("eval/level0_test_solved", test_solved, 0)
         writer.add_scalar("eval/level0_test_total", test_eval["total"], 0)
-        writer.add_scalar("eval/level1_solved", level1_eval["solved"], 0)
+        writer.add_scalar("eval/level1_solved", level1_solved, 0)
         writer.add_scalar("eval/level1_total", level1_eval["total"], 0)
         writer.add_scalar(
             "eval/level0_test_success_rate",
-            test_eval["solved"] / max(1, test_eval["total"]),
+            test_solved / max(1, test_eval["total"]),
             0,
         )
         writer.add_scalar(
             "eval/level1_success_rate",
-            level1_eval["solved"] / max(1, level1_eval["total"]),
+            level1_solved / max(1, level1_eval["total"]),
             0,
         )
         writer.flush()

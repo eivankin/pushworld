@@ -6,9 +6,21 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-NESTED_UPSTREAM_ROOT = PROJECT_ROOT / "external" / "pushworld"
-LOCAL_UPSTREAM_ROOT = PROJECT_ROOT
-UPSTREAM_ROOT = NESTED_UPSTREAM_ROOT if (NESTED_UPSTREAM_ROOT / "python3" / "src").exists() else LOCAL_UPSTREAM_ROOT
+
+
+def _find_upstream_root() -> Path:
+    candidates = (
+        PROJECT_ROOT / "external" / "pushworld" / "external" / "pushworld",
+        PROJECT_ROOT / "external" / "pushworld",
+        PROJECT_ROOT,
+    )
+    for candidate in candidates:
+        if (candidate / "python3" / "src" / "pushworld" / "puzzle.py").exists():
+            return candidate
+    return PROJECT_ROOT / "external" / "pushworld"
+
+
+UPSTREAM_ROOT = _find_upstream_root()
 UPSTREAM_PYTHON_SRC = UPSTREAM_ROOT / "python3" / "src"
 BENCHMARK_PUZZLES = UPSTREAM_ROOT / "benchmark" / "puzzles"
 
